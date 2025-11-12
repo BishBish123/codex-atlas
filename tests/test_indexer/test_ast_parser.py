@@ -110,6 +110,42 @@ class TestImportsAndCalls:
         assert "os" in pf.imports
         assert "collections.OrderedDict" in pf.imports
 
+    def test_from_import_records_base_module(self, tmp_path: Path) -> None:
+        # ``from foo.bar import baz`` must record BOTH ``foo.bar`` and
+        # ``foo.bar.baz`` in ``imports``. Recording only the symbol form
+        # left ``CallGraph.import_chain("foo.bar")`` blind to consumers
+        # that used the standard ``from ... import ...`` shape — by far
+        # the most common Python import.
+        f = tmp_path / "m.py"
+        f.write_text("from foo.bar import baz\n")
+        pf = parse_python_file(f, tmp_path)
+        assert "foo.bar" in pf.imports
+        assert "foo.bar.baz" in pf.imports
+
+    def test_from_import_base_module_lets_import_chain_find_module(
+        self, tmp_path: Path
+    ) -> None:
+        # End-to-end: parse ``from codex_atlas.store import ChunkStore``
+        # and assert ``import_chain("codex_atlas.store")`` finds the
+        # consumer module via the EDGE_IMPORTS reverse walk.
+        from codex_atlas.indexer.graph import CallGraph  # noqa: PLC0415
+        from codex_atlas.indexer.walker import parse_corpus  # noqa: PLC0415
+
+        # Stand up a tiny package that mirrors the real-world shape.
+        (tmp_path / "codex_atlas").mkdir()
+        (tmp_path / "codex_atlas" / "__init__.py").write_text("")
+        (tmp_path / "codex_atlas" / "store.py").write_text(
+            "class ChunkStore: ...\n"
+        )
+        (tmp_path / "consumer.py").write_text(
+            "from codex_atlas.store import ChunkStore\n"
+        )
+        parsed = parse_corpus(tmp_path)
+        g = CallGraph()
+        g.ingest(parsed)
+        chain = g.import_chain("codex_atlas.store")
+        assert "consumer" in chain
+
     def test_relative_import_keeps_dots(self, tmp_path: Path) -> None:
         f = tmp_path / "pkg" / "m.py"
         f.parent.mkdir()

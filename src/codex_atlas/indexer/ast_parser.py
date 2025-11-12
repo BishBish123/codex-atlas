@@ -212,12 +212,24 @@ class _Collector(ast.NodeVisitor):
             self.import_refs.append(ImportRef(local=local, target=target, level=0))
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        # `from foo.bar import baz` -> we record `foo.bar.baz`.
+        # `from foo.bar import baz` -> we record BOTH `foo.bar` (the base
+        # module, so reverse-imports walks see the module-level edge) AND
+        # `foo.bar.baz` (the fully qualified imported symbol).
         # `from . import sibling` -> we record `.sibling` so the graph
         # builder can tell relative imports apart from absolute ones.
+        #
+        # Recording only the qualified symbol form previously left
+        # ``import_chain("foo.bar")`` blind to the most common Python
+        # import shape — the module never received a back-edge from
+        # consumers that used ``from foo.bar import baz``.
         level = node.level or 0
         dots = "." * level
         module = node.module or ""
+        # Append the base module import once when ``node.module`` is
+        # present, so ``import_chain`` reverse-walks reach the module via
+        # the same EDGE_IMPORTS path used by plain ``import foo.bar``.
+        if module:
+            self.imports.append(f"{dots}{module}")
         for alias in node.names:
             if dots and not module:
                 target = f"{dots}{alias.name}"

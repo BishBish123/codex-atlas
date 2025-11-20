@@ -90,3 +90,38 @@ class TestDocstringCapture:
         pf = parse_python_file(f, tmp_path)
         sym = next(s for s in pf.symbols if s.qualified_name == "m.f")
         assert sym.docstring is None
+
+
+class TestTypeAliases:
+    def test_plain_assignment_alias(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("Path = str\n")
+        pf = parse_python_file(f, tmp_path)
+        targets = {a.qualified_name: a.target for a in pf.type_aliases}
+        assert targets == {"m.Path": "str"}
+
+    def test_subscripted_alias(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("Items = list[int]\n")
+        pf = parse_python_file(f, tmp_path)
+        names = {a.qualified_name for a in pf.type_aliases}
+        assert "m.Items" in names
+
+    def test_constant_assignment_skipped(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("X = 42\n")
+        pf = parse_python_file(f, tmp_path)
+        assert pf.type_aliases == []
+
+    def test_call_assignment_skipped(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("X = make_thing()\n")
+        pf = parse_python_file(f, tmp_path)
+        assert pf.type_aliases == []
+
+    def test_pep_613_typealias_annotation(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("from typing import TypeAlias\nIds: TypeAlias = list[int]\n")
+        pf = parse_python_file(f, tmp_path)
+        names = {a.qualified_name for a in pf.type_aliases}
+        assert "m.Ids" in names

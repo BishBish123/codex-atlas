@@ -125,3 +125,41 @@ class TestTypeAliases:
         pf = parse_python_file(f, tmp_path)
         names = {a.qualified_name for a in pf.type_aliases}
         assert "m.Ids" in names
+
+
+class TestImportRefs:
+    def test_simple_import(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("import os\n")
+        pf = parse_python_file(f, tmp_path)
+        refs = {(r.local, r.target) for r in pf.import_refs}
+        assert ("os", "os") in refs
+
+    def test_import_as_renames_local(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("import numpy as np\n")
+        pf = parse_python_file(f, tmp_path)
+        refs = {(r.local, r.target) for r in pf.import_refs}
+        assert ("np", "numpy") in refs
+
+    def test_from_import_records_full_target(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("from foo.bar import Baz\n")
+        pf = parse_python_file(f, tmp_path)
+        refs = {(r.local, r.target) for r in pf.import_refs}
+        assert ("Baz", "foo.bar.Baz") in refs
+
+    def test_from_import_with_asname(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("from foo.bar import Baz as B\n")
+        pf = parse_python_file(f, tmp_path)
+        refs = {(r.local, r.target) for r in pf.import_refs}
+        assert ("B", "foo.bar.Baz") in refs
+
+    def test_relative_import_records_level(self, tmp_path: Path) -> None:
+        f = tmp_path / "pkg" / "m.py"
+        f.parent.mkdir()
+        f.write_text("from . import sibling\n")
+        pf = parse_python_file(f, tmp_path)
+        ref = next(r for r in pf.import_refs if r.local == "sibling")
+        assert ref.level == 1

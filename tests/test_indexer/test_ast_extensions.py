@@ -1,10 +1,15 @@
-"""Tests for the AST parser's async / decorator / docstring extensions."""
+"""Tests for the AST parser's async / decorator / type-alias / imports map extensions."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from codex_atlas.indexer.ast_parser import SymbolKind, parse_python_file
+import pytest
+
+from codex_atlas.indexer.ast_parser import (
+    SymbolKind,
+    parse_python_file,
+)
 
 
 class TestAsyncDetection:
@@ -47,6 +52,8 @@ class TestDecoratorCapture:
         assert "app.route" in sym.decorators
 
     def test_called_decorator(self, tmp_path: Path) -> None:
+        # `@pytest.mark.asyncio` parses as a Call(Attribute(...)). The
+        # parser should capture the dotted name of the call target.
         f = tmp_path / "m.py"
         f.write_text("@pytest.mark.asyncio\nasync def test_x(): pass\n")
         pf = parse_python_file(f, tmp_path)
@@ -108,12 +115,14 @@ class TestTypeAliases:
         assert "m.Items" in names
 
     def test_constant_assignment_skipped(self, tmp_path: Path) -> None:
+        # `X = 42` is data, not a type alias — must be skipped.
         f = tmp_path / "m.py"
         f.write_text("X = 42\n")
         pf = parse_python_file(f, tmp_path)
         assert pf.type_aliases == []
 
     def test_call_assignment_skipped(self, tmp_path: Path) -> None:
+        # `X = make()` is also data; constants can't be type aliases.
         f = tmp_path / "m.py"
         f.write_text("X = make_thing()\n")
         pf = parse_python_file(f, tmp_path)
@@ -163,3 +172,34 @@ class TestImportRefs:
         pf = parse_python_file(f, tmp_path)
         ref = next(r for r in pf.import_refs if r.local == "sibling")
         assert ref.level == 1
+
+
+class TestLambdaAndExpressionCalls:
+    def test_lambda_in_call_position_skipped(self, tmp_path: Path) -> None:
+        # `(lambda x: x)()` should not produce a call edge — the callee
+        # has no resolvable name.
+        f = tmp_path / "m.py"
+        f.write_text("def main():\n    (lambda x: x)(1)\n")
+        pf = parse_python_file(f, tmp_path)
+        assert pf.calls == []
+
+    def test_expression_call_skipped(self, tmp_path: Path) -> None:
+        f = tmp_path / "m.py"
+        f.write_text("def main():\n    (a + b)()\n")
+        pf = parse_python_file(f, tmp_path)
+        assert pf.calls == []
+
+
+@pytest.mark.parametrize(
+    "src,expected_count",
+    [
+        ("def a(): pass\ndef b(): pass\n", 2),
+        ("class C:\n    def m(self): pass\n", 1),
+        ("async def go(): pass\n", 1),
+    ],
+)
+def test_chunk_count_matches_expected(tmp_path: Path, src: str, expected_count: int) -> None:
+    f = tmp_path / "m.py"
+    f.write_text(src)
+    pf = parse_python_file(f, tmp_path)
+    assert len(pf.chunks) == expected_count

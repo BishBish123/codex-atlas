@@ -1,4 +1,4 @@
-"""Codex-Atlas indexer: AST parser + chunker + walker."""
+"""Codex-Atlas indexer: AST parser + chunker + walker + call graph."""
 
 from codex_atlas.indexer.ast_parser import (
     Chunk,
@@ -9,8 +9,10 @@ from codex_atlas.indexer.ast_parser import (
     TypeAlias,
     parse_python_file,
 )
+from codex_atlas.indexer.graph import CallGraph
 
 __all__ = [
+    "CallGraph",
     "Chunk",
     "ImportRef",
     "ParsedFile",

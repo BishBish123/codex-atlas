@@ -54,24 +54,42 @@ class CallGraph:
         """Add every parsed-file's symbols + calls + imports to the graph.
 
         Calls are recorded as `caller -> callee` edges keyed `kind=calls`.
-        Because the AST visitor only knows the unqualified name of the
-        callee (we have no type inference), we resolve calls to whichever
-        symbol matches the unqualified name *somewhere* in the corpus —
-        recording an edge per match. For ambiguous callees (common name
-        like `get`), the graph carries every plausible target so the
-        retriever can dedupe / rank later.
+        Resolution is two-stage:
+
+        1. **Imports-map resolution.** For each caller's source module we
+           build a `local-name -> dotted-target` map from `ImportRef`s.
+           If the callee's short name is bound in that map and the target
+           exists as a graph node, we record an edge to that exact target
+           and skip the corpus-wide fallback. This is much sharper than
+           short-name matching: it avoids over-matching common names like
+           ``get`` / ``add``.
+        2. **Short-name fallback.** If the callee is not bound by an
+           import or its target is not a known symbol, we fall back to
+           recording an edge per qualified-name match in the corpus
+           (preserving the existing v1 behaviour for unresolved calls).
         """
+        # Materialise once so we can iterate multiple times below.
+        parsed_list = list(parsed)
+
         # Index unqualified-name -> set of qualified names so call resolution
         # is O(1) per call.
         unqualified_index: dict[str, set[str]] = {}
-        for pf in parsed:
+        for pf in parsed_list:
             for sym in pf.symbols:
                 self.add_symbol(sym)
                 short = sym.qualified_name.rsplit(".", 1)[-1]
                 unqualified_index.setdefault(short, set()).add(sym.qualified_name)
 
+        # Per-module local-name -> dotted-target map for imports resolution.
+        imports_map: dict[str, dict[str, str]] = {}
+        for pf in parsed_list:
+            local_to_target: dict[str, str] = {}
+            for ref in pf.import_refs:
+                local_to_target[ref.local] = ref.target
+            imports_map[pf.module_name] = local_to_target
+
         # `defines`: module -> any class/function/method directly inside it.
-        for pf in parsed:
+        for pf in parsed_list:
             for sym in pf.symbols:
                 if sym.kind is SymbolKind.MODULE:
                     continue
@@ -79,18 +97,27 @@ class CallGraph:
                     self.add_edge(pf.module_name, sym.qualified_name, EDGE_DEFINES)
 
         # `imports`: module -> imported module/symbol (best-effort, may dangle).
-        for pf in parsed:
+        for pf in parsed_list:
             for imp in pf.imports:
                 if imp:
                     self.add_edge(pf.module_name, imp, EDGE_IMPORTS)
 
-        # `calls`: caller -> every plausible callee (matched by short name).
-        for pf in parsed:
+        # `calls`: caller -> callee, imports-aware first, short-name fallback.
+        for pf in parsed_list:
+            local_to_target = imports_map.get(pf.module_name, {})
             for caller, callee_short in pf.calls:
-                for resolved in unqualified_index.get(callee_short, ()):
-                    if resolved == caller:
+                resolved_via_import: str | None = None
+                target = local_to_target.get(callee_short)
+                if target is not None and self._g.has_node(target):
+                    resolved_via_import = target
+                if resolved_via_import is not None:
+                    if resolved_via_import != caller:
+                        self.add_edge(caller, resolved_via_import, EDGE_CALLS)
+                    continue
+                for candidate in unqualified_index.get(callee_short, ()):
+                    if candidate == caller:
                         continue  # ignore self-loops
-                    self.add_edge(caller, resolved, EDGE_CALLS)
+                    self.add_edge(caller, candidate, EDGE_CALLS)
 
     # ---------- queries ----------
 
@@ -126,6 +153,37 @@ class CallGraph:
         forward = set(self.find_callees(qualified_name, depth))
         backward = set(self.find_callers(qualified_name, depth))
         return sorted(forward | backward)
+
+    def caller_callee_neighborhood(
+        self, qualified_name: str, depth: int = 2
+    ) -> dict[str, list[str]]:
+        """Both-direction BFS up to `depth` hops, with results split by direction.
+
+        Returns ``{"callers": [...], "callees": [...], "all": [...]}``.
+        Useful for the retriever's `caller_callee_neighborhood` route, which
+        wants to render "everything within K hops of this symbol" without
+        re-running two queries.
+        """
+        if depth <= 0:
+            raise ValueError("depth must be positive")
+        callers = self.find_callers(qualified_name, depth=depth)
+        callees = self.find_callees(qualified_name, depth=depth)
+        union = sorted({*callers, *callees})
+        return {"callers": callers, "callees": callees, "all": union}
+
+    def import_chain(self, qualified_name: str, max_depth: int = 4) -> list[str]:
+        """Walk imports edges backward from `qualified_name` to its source modules.
+
+        Given a symbol, return modules that (transitively) import it via
+        the `imports` edge kind. The depth is bounded so we don't traverse
+        a 50K-node graph unbounded; in practice 3-4 hops is more than
+        enough to show "who pulls this in".
+        """
+        if max_depth <= 0:
+            raise ValueError("max_depth must be positive")
+        if qualified_name not in self._g:
+            return []
+        return list(self._traverse(qualified_name, max_depth, predecessors=True, kind=EDGE_IMPORTS))
 
     def _traverse(self, start: str, depth: int, *, predecessors: bool, kind: str) -> Iterable[str]:
         seen: set[str] = {start}

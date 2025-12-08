@@ -99,20 +99,29 @@ class CallGraph:
                 short = sym.qualified_name.rsplit(".", 1)[-1]
                 unqualified_index.setdefault(short, set()).add(sym.qualified_name)
 
-        # Per-module local-name -> dotted-target map for imports resolution.
-        # Relative imports (level >= 1) are reified to absolute targets here
-        # using the parsed file's own module_name as the anchor — without
-        # this, ``from . import x`` would never line up with the absolute
-        # qname recorded for ``x`` elsewhere in the corpus.
-        imports_map: dict[str, dict[str, str]] = {}
+        # Per-module + per-scope local-name -> dotted-target map.
+        # Relative imports (level >= 1) are reified to absolute targets
+        # here using the parsed file's own module_name as the anchor —
+        # without this, ``from . import x`` would never line up with the
+        # absolute qname recorded for ``x`` elsewhere in the corpus.
+        #
+        # The outer key is the importing module; the inner key is the
+        # qualified name of the enclosing function (``ImportRef.scope``)
+        # for function-local imports, or ``None`` for module-level
+        # imports. Splitting by scope means a function-local
+        # ``def f(): import foo as bar`` cannot retarget calls in an
+        # unrelated caller that happens to use ``bar()`` — earlier the
+        # imports map was applied module-wide and a local rebind leaked
+        # into every other caller in the same module.
+        imports_map: dict[str, dict[str | None, dict[str, str]]] = {}
         for pf in parsed_list:
-            local_to_target: dict[str, str] = {}
+            scoped: dict[str | None, dict[str, str]] = {}
             for ref in pf.import_refs:
                 target = _resolve_import_target(pf.module_name, ref)
                 if target is None:
                     continue
-                local_to_target[ref.local] = target
-            imports_map[pf.module_name] = local_to_target
+                scoped.setdefault(ref.scope, {})[ref.local] = target
+            imports_map[pf.module_name] = scoped
 
         # `defines`: module -> any class/function/method directly inside it.
         for pf in parsed_list:
@@ -129,11 +138,21 @@ class CallGraph:
                     self.add_edge(pf.module_name, imp, EDGE_IMPORTS)
 
         # `calls`: caller -> callee, imports-aware first, short-name fallback.
+        # Resolution order per call:
+        #   1. ``imports_map[module][caller]`` — function-local binding
+        #      in the caller's own scope (if any).
+        #   2. ``imports_map[module][None]`` — module-level binding.
+        #   3. Short-name fallback across the corpus.
         for pf in parsed_list:
-            local_to_target = imports_map.get(pf.module_name, {})
+            scoped = imports_map.get(pf.module_name, {})
+            local_scope = scoped.get(None, {})
             for caller, callee_short in pf.calls:
                 resolved_via_import: str | None = None
-                target = local_to_target.get(callee_short)
+                # Prefer the caller's own function-local binding.
+                caller_scope = scoped.get(caller, {})
+                target = caller_scope.get(callee_short)
+                if target is None:
+                    target = local_scope.get(callee_short)
                 if target is not None and self._g.has_node(target):
                     resolved_via_import = target
                 if resolved_via_import is not None:

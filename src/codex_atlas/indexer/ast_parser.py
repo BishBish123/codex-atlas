@@ -83,11 +83,20 @@ class ImportRef:
 
     `from foo.bar import Baz as B` -> `ImportRef(local="B", target="foo.bar.Baz", level=0)`.
     `from . import sibling` -> `ImportRef(local="sibling", target="sibling", level=1)`.
+
+    ``scope`` is the qualified name of the enclosing function/method when
+    the import statement is local to a callable body (``def f(): import
+    foo``); ``None`` means the import lives at module scope. The graph
+    builder uses this to resolve callee names against the *caller's*
+    nearest binding first — without it, a function-local import would
+    bleed into every other caller in the same module that happens to use
+    the same short name.
     """
 
     local: str
     target: str
     level: int = 0
+    scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -209,7 +218,14 @@ class _Collector(ast.NodeVisitor):
             # asname is supplied; `import foo.bar as fb` exposes `fb`
             # bound to the full dotted target.
             target = alias.name if alias.asname else alias.name.split(".", 1)[0]
-            self.import_refs.append(ImportRef(local=local, target=target, level=0))
+            self.import_refs.append(
+                ImportRef(
+                    local=local,
+                    target=target,
+                    level=0,
+                    scope=self._current_callable,
+                )
+            )
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         # `from foo.bar import baz` -> we record BOTH `foo.bar` (the base
@@ -242,7 +258,14 @@ class _Collector(ast.NodeVisitor):
             # Strip leading dots for the target stored in ImportRef so
             # downstream resolution can match qualified names directly.
             ref_target = target.lstrip(".")
-            self.import_refs.append(ImportRef(local=local, target=ref_target, level=level))
+            self.import_refs.append(
+                ImportRef(
+                    local=local,
+                    target=ref_target,
+                    level=level,
+                    scope=self._current_callable,
+                )
+            )
 
     # ---------- classes ----------
 

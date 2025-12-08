@@ -92,6 +92,60 @@ class TestImportsAwareResolution:
         g.ingest([a, c])
         assert g.find_callees("caller.run") == ["lib_a.helper"]
 
+    def test_function_local_import_does_not_leak_into_other_callers(self) -> None:
+        # ``caller.f`` does ``def f(): import lib_a.helper as h; h()`` —
+        # the local rebind is scoped to ``caller.f`` only.
+        # ``caller.g`` calls ``h()`` too but has NO local import; the
+        # bare short name must NOT pick up ``caller.f``'s function-local
+        # binding. Without scoped imports the module-wide map applied
+        # ``h -> lib_a.helper`` to every caller in the file, masking a
+        # legitimate same-name module-level symbol.
+        lib = _parsed(module="lib_a", syms=[_sym("lib_a.helper")], calls=[])
+        # Module-level callable also called ``h`` lives in another module
+        # — the short-name fallback should reach it from caller.g.
+        h_module = _parsed(module="other", syms=[_sym("other.h")], calls=[])
+        caller_pf = _parsed(
+            module="caller",
+            syms=[_sym("caller.f"), _sym("caller.g")],
+            calls=[("caller.f", "h"), ("caller.g", "h")],
+            import_refs=[
+                ImportRef(
+                    local="h", target="lib_a.helper", level=0, scope="caller.f"
+                )
+            ],
+        )
+        g = CallGraph()
+        g.ingest([lib, h_module, caller_pf])
+        # caller.f resolves via its own scope to lib_a.helper.
+        assert g.find_callees("caller.f") == ["lib_a.helper"]
+        # caller.g must NOT see caller.f's local rebind; it falls back to
+        # the short-name match in another module.
+        assert g.find_callees("caller.g") == ["other.h"]
+
+    def test_caller_local_import_overrides_module_import(self) -> None:
+        # Module-level imports ``h`` from ``lib_a``; caller.f rebinds ``h``
+        # locally to ``lib_b.helper``. caller.f must use the local; other
+        # callers in the same module must use the module-level binding.
+        lib_a = _parsed(module="lib_a", syms=[_sym("lib_a.helper")], calls=[])
+        lib_b = _parsed(module="lib_b", syms=[_sym("lib_b.helper")], calls=[])
+        caller_pf = _parsed(
+            module="caller",
+            syms=[_sym("caller.f"), _sym("caller.g")],
+            calls=[("caller.f", "h"), ("caller.g", "h")],
+            import_refs=[
+                # Module-level import: h -> lib_a.helper
+                ImportRef(local="h", target="lib_a.helper", level=0, scope=None),
+                # caller.f-local override: h -> lib_b.helper
+                ImportRef(
+                    local="h", target="lib_b.helper", level=0, scope="caller.f"
+                ),
+            ],
+        )
+        g = CallGraph()
+        g.ingest([lib_a, lib_b, caller_pf])
+        assert g.find_callees("caller.f") == ["lib_b.helper"]
+        assert g.find_callees("caller.g") == ["lib_a.helper"]
+
 
 class TestNeighborhood:
     def test_basic_two_hop_neighborhood(self) -> None:

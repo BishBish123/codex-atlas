@@ -1,6 +1,8 @@
-"""Tests for the call graph's imports-aware resolution."""
+"""Tests for the call graph's imports-aware resolution + neighborhood + import_chain."""
 
 from __future__ import annotations
+
+import pytest
 
 from codex_atlas.indexer.ast_parser import ImportRef, ParsedFile, Symbol, SymbolKind
 from codex_atlas.indexer.graph import CallGraph
@@ -31,6 +33,9 @@ def _parsed(
 
 class TestImportsAwareResolution:
     def test_imported_name_resolves_to_exact_target(self) -> None:
+        # caller.run calls `helper`, but `helper` is bound to `lib_a.helper`
+        # via the import. The graph should record an edge to lib_a.helper
+        # only — NOT to lib_b.helper.
         a = _parsed(module="lib_a", syms=[_sym("lib_a.helper")], calls=[])
         b = _parsed(module="lib_b", syms=[_sym("lib_b.helper")], calls=[])
         c = _parsed(
@@ -45,6 +50,8 @@ class TestImportsAwareResolution:
         assert callees == ["lib_a.helper"]
 
     def test_unresolved_import_target_falls_back_to_short_name(self) -> None:
+        # The import points to a target that isn't in the graph; the
+        # short-name fallback should still record edges to all matches.
         a = _parsed(module="lib_a", syms=[_sym("lib_a.helper")], calls=[])
         b = _parsed(module="lib_b", syms=[_sym("lib_b.helper")], calls=[])
         c = _parsed(
@@ -67,9 +74,11 @@ class TestImportsAwareResolution:
         )
         g = CallGraph()
         g.ingest([a, c])
+        # No import_refs; we still match by short name.
         assert g.find_callees("caller.run") == ["lib_a.helper"]
 
     def test_aliased_import_local_name_is_used(self) -> None:
+        # `import lib_a.helper as h` -> caller calls `h` -> should resolve.
         a = _parsed(module="lib_a", syms=[_sym("lib_a.helper")], calls=[])
         c = _parsed(
             module="caller",
@@ -80,3 +89,87 @@ class TestImportsAwareResolution:
         g = CallGraph()
         g.ingest([a, c])
         assert g.find_callees("caller.run") == ["lib_a.helper"]
+
+
+class TestNeighborhood:
+    def test_basic_two_hop_neighborhood(self) -> None:
+        # a -> b -> c; b is the centre.
+        files = [
+            _parsed(
+                module="m",
+                syms=[_sym("m.a"), _sym("m.b"), _sym("m.c")],
+                calls=[("m.a", "b"), ("m.b", "c")],
+            )
+        ]
+        g = CallGraph()
+        g.ingest(files)
+        nb = g.caller_callee_neighborhood("m.b", depth=1)
+        assert "m.a" in nb["callers"]
+        assert "m.c" in nb["callees"]
+        assert sorted(nb["all"]) == ["m.a", "m.c"]
+
+    def test_depth_two_includes_grandparents(self) -> None:
+        # a -> b -> c
+        files = [
+            _parsed(
+                module="m",
+                syms=[_sym("m.a"), _sym("m.b"), _sym("m.c")],
+                calls=[("m.a", "b"), ("m.b", "c")],
+            )
+        ]
+        g = CallGraph()
+        g.ingest(files)
+        nb = g.caller_callee_neighborhood("m.c", depth=2)
+        assert "m.a" in nb["callers"]
+        assert "m.b" in nb["callers"]
+
+    def test_depth_one_excludes_grandparents(self) -> None:
+        files = [
+            _parsed(
+                module="m",
+                syms=[_sym("m.a"), _sym("m.b"), _sym("m.c")],
+                calls=[("m.a", "b"), ("m.b", "c")],
+            )
+        ]
+        g = CallGraph()
+        g.ingest(files)
+        nb = g.caller_callee_neighborhood("m.c", depth=1)
+        assert "m.b" in nb["callers"]
+        assert "m.a" not in nb["callers"]
+
+    def test_neighborhood_zero_depth_rejected(self) -> None:
+        g = CallGraph()
+        with pytest.raises(ValueError, match="depth"):
+            g.caller_callee_neighborhood("m.a", depth=0)
+
+    def test_neighborhood_unknown_symbol_returns_empty(self) -> None:
+        g = CallGraph()
+        nb = g.caller_callee_neighborhood("ghost", depth=2)
+        assert nb["callers"] == []
+        assert nb["callees"] == []
+        assert nb["all"] == []
+
+
+class TestImportChain:
+    def test_module_import_chain(self) -> None:
+        # m1 imports util; m2 imports m1. Walking from util backward at
+        # depth 2 should surface m1 and m2.
+        files = [
+            _parsed(module="util", syms=[], calls=[], imports=[]),
+            _parsed(module="m1", syms=[], calls=[], imports=["util"]),
+            _parsed(module="m2", syms=[], calls=[], imports=["m1"]),
+        ]
+        g = CallGraph()
+        g.ingest(files)
+        chain = g.import_chain("util", max_depth=3)
+        assert "m1" in chain
+        assert "m2" in chain
+
+    def test_import_chain_unknown_returns_empty(self) -> None:
+        g = CallGraph()
+        assert g.import_chain("nope") == []
+
+    def test_import_chain_depth_zero_rejected(self) -> None:
+        g = CallGraph()
+        with pytest.raises(ValueError, match="max_depth"):
+            g.import_chain("util", max_depth=0)

@@ -32,6 +32,8 @@ class Route(StrEnum):
     STRUCTURAL = "structural"
     HYBRID = "hybrid"
     SUMMARIZATION = "summarization"
+    NEIGHBORHOOD = "neighborhood"
+    IMPORT_CHAIN = "import_chain"
 
 
 @dataclass(frozen=True)
@@ -95,13 +97,53 @@ _HYBRID_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
+_NEIGHBORHOOD_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bneighborhood (?:of|around)\b",
+        r"\b(?:everything|all) (?:near|around|surrounding)\b",
+        r"\b(?:both|caller and callee|callee and caller)\b",
+    )
+)
 
-def classify(query: str) -> RoutingDecision:
-    """Return the route + confidence + matched signals for a free-form question."""
+_IMPORT_CHAIN_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bimport chain\b",
+        r"\b(?:who|which modules?) imports?\b",
+        r"\bwhere is .* imported from\b",
+    )
+)
+
+
+def classify(query: str) -> RoutingDecision:  # noqa: PLR0911
+    """Return the route + confidence + matched signals for a free-form question.
+
+    Routes are tried in priority order; the first regex hit wins.
+    Confidences are *calibrated*, not arbitrary: they reflect the
+    observed precision of each rule on the 30-question hand-graded
+    development set (see ``evals/INTERPRETATION.md``). The lookup
+    fallback is intentionally low-confidence so the agent's grader can
+    decide whether to re-route via the rewrite loop.
+    """
     q = query.strip()
     if not q:
         return RoutingDecision(route=Route.LOOKUP, confidence=0.5, signals=["empty-query"])
 
+    for p in _IMPORT_CHAIN_PATTERNS:
+        if p.search(q):
+            return RoutingDecision(
+                route=Route.IMPORT_CHAIN,
+                confidence=0.92,
+                signals=[f"import_chain:{p.pattern}"],
+            )
+    for p in _NEIGHBORHOOD_PATTERNS:
+        if p.search(q):
+            return RoutingDecision(
+                route=Route.NEIGHBORHOOD,
+                confidence=0.9,
+                signals=[f"neighborhood:{p.pattern}"],
+            )
     for p in _STRUCTURAL_PATTERNS:
         if p.search(q):
             return RoutingDecision(
@@ -132,6 +174,73 @@ class RetrieverConfig:
     top_k: int = 8
     graph_depth: int = 1
     summary_top_k: int = 12
+    neighborhood_depth: int = 2
+    import_chain_max_depth: int = 4
+    # Hybrid scorer weights — must sum to ~1.0 by convention but the
+    # scorer normalises so any non-negative weights work in tests.
+    hybrid_weight_cosine: float = 0.6
+    hybrid_weight_graph: float = 0.25
+    hybrid_weight_fulltext: float = 0.15
+
+
+@dataclass(frozen=True)
+class HybridScore:
+    """Per-chunk scoring breakdown for the hybrid scorer."""
+
+    qualified_name: str
+    cosine: float
+    graph_distance: int  # 0 = seed; 1 = direct neighbour; ...
+    fulltext: float
+    combined: float
+
+
+def hybrid_score(
+    chunks: list[StoredChunk],
+    *,
+    query: str,
+    seeds: set[str],
+    graph_distances: dict[str, int],
+    weights: tuple[float, float, float] = (0.6, 0.25, 0.15),
+) -> list[HybridScore]:
+    """Combine cosine + graph-distance + tfidf-ish full-text into one score.
+
+    `chunks` carry a cosine score from the vector store. Graph distance
+    is taken from `graph_distances[qname]` (0 if missing — i.e. unknown,
+    treated as "far"). Full-text is a coarse term-overlap fraction
+    against the query — not a real TF-IDF, but cheap and monotonic with
+    relevance. Weights are passed in so the agent / config can tune at
+    runtime; we normalise so callers can pass un-normalised vectors.
+    """
+    if any(w < 0 for w in weights):
+        raise ValueError("weights must be non-negative")
+    total = sum(weights)
+    if total <= 0:
+        raise ValueError("at least one weight must be positive")
+    w_cos, w_graph, w_text = (w / total for w in weights)
+
+    q_terms = {t for t in re.split(r"\W+", query.lower()) if len(t) >= 3}
+    out: list[HybridScore] = []
+    for c in chunks:
+        cosine = max(0.0, min(1.0, c.score))
+        # Seeds get distance 0 by convention; everything else uses the
+        # explicit map (with a far-away default).
+        gd = 0 if c.qualified_name in seeds else graph_distances.get(c.qualified_name, 99)
+        # Distance score: 1.0 at distance 0, decays as 1 / (1 + d).
+        gd_score = 1.0 / (1.0 + gd)
+        text_terms = {t for t in re.split(r"\W+", c.text.lower()) if len(t) >= 3}
+        overlap = len(q_terms & text_terms) / len(q_terms) if q_terms else 0.0
+        combined = w_cos * cosine + w_graph * gd_score + w_text * overlap
+        out.append(
+            HybridScore(
+                qualified_name=c.qualified_name,
+                cosine=cosine,
+                graph_distance=gd,
+                fulltext=overlap,
+                combined=combined,
+            )
+        )
+    out.sort(key=lambda s: s.combined, reverse=True)
+    return out
 
 
 class Retriever:
@@ -161,6 +270,10 @@ class Retriever:
                 chunks, extras = await self._hybrid(query)
             case Route.SUMMARIZATION:
                 chunks, extras = await self._summarization(query)
+            case Route.NEIGHBORHOOD:
+                chunks, extras = await self._neighborhood(query)
+            case Route.IMPORT_CHAIN:
+                chunks, extras = await self._import_chain(query)
         return RetrievalResult(
             route=decision.route,
             confidence=decision.confidence,
@@ -224,6 +337,31 @@ class Retriever:
                     expansions.append(neighbour)
                     seen.add(neighbour)
         return seed, expansions
+
+    async def _neighborhood(self, query: str) -> tuple[list[StoredChunk], list[str]]:
+        target = _extract_qualified_name(query, self._graph)
+        if target is None:
+            return await self._vector_topk(query, self._config.top_k), []
+        nb = self._graph.caller_callee_neighborhood(target, depth=self._config.neighborhood_depth)
+        related = sorted({target, *nb["all"]})
+        chunks: list[StoredChunk] = []
+        for q in related[: self._config.top_k]:
+            sc = await self._store.fetch_by_qualified_name(q)
+            if sc is not None:
+                chunks.append(sc)
+        return chunks, related
+
+    async def _import_chain(self, query: str) -> tuple[list[StoredChunk], list[str]]:
+        target = _extract_qualified_name(query, self._graph)
+        if target is None:
+            return await self._vector_topk(query, self._config.top_k), []
+        chain = self._graph.import_chain(target, max_depth=self._config.import_chain_max_depth)
+        chunks: list[StoredChunk] = []
+        for q in chain[: self._config.top_k]:
+            sc = await self._store.fetch_by_qualified_name(q)
+            if sc is not None:
+                chunks.append(sc)
+        return chunks, chain
 
 
 # ---------------------------------------------------------------------------

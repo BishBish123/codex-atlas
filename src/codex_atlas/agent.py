@@ -1,6 +1,6 @@
-"""LangGraph-style agent loop with reflection + bounded re-query.
+"""LangGraph-style agent loop with reflection + bounded re-query + validate.
 
-The state machine has six nodes:
+The state machine has seven nodes:
 
     classify -> retrieve -> grade ─┐
                   ▲                │
@@ -9,25 +9,39 @@ The state machine has six nodes:
                                  │
                                  ▼
                               answer
+                                 │
+                                 ▼
+                              validate
+                                 │
+                                 ▼
+                          (final result)
 
-`Grader` and `Synthesizer` are protocols so the agent runs with any LLM
-(or with deterministic fakes for offline testing). The default grader is
-a heuristic over chunk count + retriever confidence; swap in an LLM-as-
-judge implementation for production-grade accuracy.
+`Grader`, `Synthesizer`, and the validator are protocols so the agent
+runs with any LLM (or with deterministic fakes for offline testing). The
+default grader is a heuristic over chunk count + retriever confidence;
+swap in an LLM-as-judge implementation for production-grade accuracy.
 
 Every state transition is timestamped + logged so adding Langfuse later
-is local: subscribe to the trace stream and emit spans.
+is local: subscribe to the trace stream and emit spans. The `tool_calls`
+log records every retriever invocation so an external observability
+plane can stitch them into a span tree without re-implementing the
+state machine.
 """
 
 from __future__ import annotations
 
+import asyncio
+import re
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Any, Protocol, TypeVar
 
 from codex_atlas.retriever import RetrievalResult, Retriever, Route
 from codex_atlas.store import StoredChunk
+
+T = TypeVar("T")
 
 
 class Node(StrEnum):
@@ -36,6 +50,23 @@ class Node(StrEnum):
     GRADE = "grade"
     REWRITE = "rewrite_query"
     ANSWER = "answer"
+    VALIDATE = "validate"
+    CANCEL = "cancel"
+
+
+class CancelReason(StrEnum):
+    """Why the agent terminated early."""
+
+    TIMEOUT = "timeout"
+    EXTERNAL = "external"
+
+
+class _Cancelled(Exception):
+    """Internal control-flow signal: the run was cancelled."""
+
+    def __init__(self, reason: CancelReason) -> None:
+        super().__init__(str(reason))
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -46,6 +77,34 @@ class TraceEvent:
     started_at: float
     elapsed_ms: float
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """One retriever invocation — what query, which route, what came back."""
+
+    query: str
+    route: Route
+    n_chunks: int
+    elapsed_ms: float
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    """Per-claim grounded-vs-ungrounded breakdown.
+
+    A claim is *grounded* when it explicitly cites a chunk by qualified
+    name and that name appears in the retrieved chunks. Anything else
+    (free-form prose, hand-waving) is conservatively counted as
+    ungrounded — false negatives there cost less than false positives.
+    """
+
+    n_claims: int
+    n_grounded: int
+    ungrounded_claims: list[str]
+    grounded_qualified_names: list[str]
+    is_acceptable: bool
 
 
 @dataclass(frozen=True)
@@ -70,6 +129,9 @@ class AgentResult:
     grade: float
     attempts: int
     trace: list[TraceEvent]
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    validation: ValidationReport | None = None
+    cancelled: CancelReason | None = None
 
 
 @dataclass
@@ -82,6 +144,8 @@ class _State:
     retrieval: RetrievalResult | None = None
     grade: float = 0.0
     trace: list[TraceEvent] = field(default_factory=list)
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    cancelled: CancelReason | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +169,20 @@ class Synthesizer(Protocol):
     """Compose the final answer from query + retrieved chunks."""
 
     async def synthesize(self, query: str, chunks: list[StoredChunk]) -> str: ...
+
+
+class Validator(Protocol):
+    """Audit a synthesised answer against the retrieved chunks.
+
+    Implementations return a ``ValidationReport`` flagging any claims
+    that aren't grounded in a cited qualified name. The default
+    implementation is a regex-based citation extractor; production swaps
+    in an LLM judge that re-reads claims against chunk text.
+    """
+
+    async def validate(
+        self, query: str, answer: str, chunks: list[StoredChunk]
+    ) -> ValidationReport: ...
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +215,56 @@ class NoopRewriter:
         retrieved: list[StoredChunk],
     ) -> str:
         return f"{original} (in this codebase, with code-level detail)"
+
+
+@dataclass(frozen=True)
+class CitationValidator:
+    """Default validator: every backticked qualified-name in the answer
+    must appear in the retrieved chunks. Anything else is ungrounded.
+
+    The threshold is the minimum grounded fraction at which we accept
+    the answer. Below it the answer is rejected (the agent's caller can
+    decide whether to re-route or surface the warning).
+    """
+
+    accept_threshold: float = 0.5
+    # Match backticked qualified names: `pkg.module.symbol` (>=2 parts).
+    _claim_re: re.Pattern[str] = re.compile(r"`([A-Za-z_][\w.]*\.[A-Za-z_]\w*)`")
+
+    async def validate(
+        self, query: str, answer: str, chunks: list[StoredChunk]
+    ) -> ValidationReport:
+        cited_qnames = {c.qualified_name for c in chunks}
+        claims = self._claim_re.findall(answer)
+        if not claims:
+            # Nothing claim-shaped to validate — treat as acceptable; the
+            # synthesiser must have hedged. (Prevents punishing a
+            # well-formed "I couldn't find it" message.)
+            return ValidationReport(
+                n_claims=0,
+                n_grounded=0,
+                ungrounded_claims=[],
+                grounded_qualified_names=[],
+                is_acceptable=True,
+            )
+        grounded: list[str] = []
+        ungrounded: list[str] = []
+        for c in claims:
+            if c in cited_qnames or any(
+                q.endswith(f".{c}") or c.endswith(f".{q}") for q in cited_qnames
+            ):
+                grounded.append(c)
+            else:
+                ungrounded.append(c)
+        n = len(claims)
+        ratio = len(grounded) / n if n else 1.0
+        return ValidationReport(
+            n_claims=n,
+            n_grounded=len(grounded),
+            ungrounded_claims=ungrounded,
+            grounded_qualified_names=grounded,
+            is_acceptable=ratio >= self.accept_threshold,
+        )
 
 
 @dataclass(frozen=True)
@@ -175,6 +303,10 @@ class StitchSynthesizer:
 class AgentConfig:
     grade_threshold: float = 0.7
     max_attempts: int = 3
+    # Per-step timeout for the retriever / synthesiser. None disables.
+    step_timeout_s: float | None = None
+    # Whole-run timeout (across all retries). None disables.
+    run_timeout_s: float | None = None
 
 
 class Agent:
@@ -186,31 +318,51 @@ class Agent:
         synthesizer: Synthesizer | None = None,
         grader: Grader | None = None,
         rewriter: QueryRewriter | None = None,
+        validator: Validator | None = None,
         config: AgentConfig | None = None,
     ) -> None:
         self._retriever = retriever
         self._synth = synthesizer or StitchSynthesizer()
         self._grader = grader or HeuristicGrader()
         self._rewriter = rewriter or NoopRewriter()
+        self._validator = validator or CitationValidator()
         self._config = config or AgentConfig()
 
     async def run(self, query: str) -> AgentResult:
+        run_t0 = time.perf_counter()
         state = _State(original_query=query, query=query)
-        # CLASSIFY + RETRIEVE happen together inside the retriever — we
-        # track them as separate trace events to keep the LangGraph
-        # vocabulary intact in the trace dump.
-        await self._retrieve(state)
-        await self._grade(state)
+        try:
+            await self._with_run_deadline(self._retrieve(state), run_t0)
+            await self._with_run_deadline(self._grade(state), run_t0)
 
-        while (
-            state.grade < self._config.grade_threshold
-            and state.attempts < self._config.max_attempts - 1
-        ):
-            await self._rewrite(state)
-            await self._retrieve(state)
-            await self._grade(state)
+            while (
+                state.cancelled is None
+                and state.grade < self._config.grade_threshold
+                and state.attempts < self._config.max_attempts - 1
+            ):
+                await self._with_run_deadline(self._rewrite(state), run_t0)
+                await self._with_run_deadline(self._retrieve(state), run_t0)
+                await self._with_run_deadline(self._grade(state), run_t0)
 
-        answer, citations = await self._answer(state)
+            if state.cancelled is None:
+                answer, citations = await self._with_run_deadline(self._answer(state), run_t0)
+                validation = await self._with_run_deadline(
+                    self._validate(state, answer, citations), run_t0
+                )
+            else:
+                answer, citations, validation = ("", [], None)
+        except _Cancelled as exc:
+            state.cancelled = exc.reason
+            state.trace.append(
+                TraceEvent(
+                    node=Node.CANCEL,
+                    started_at=time.perf_counter(),
+                    elapsed_ms=0.0,
+                    detail=f"reason={exc.reason}",
+                )
+            )
+            answer, citations, validation = ("", [], None)
+
         return AgentResult(
             query=state.original_query,
             final_query=state.query,
@@ -220,20 +372,43 @@ class Agent:
             grade=state.grade,
             attempts=state.attempts + 1,
             trace=state.trace,
+            tool_calls=state.tool_calls,
+            validation=validation,
+            cancelled=state.cancelled,
         )
+
+    async def _with_run_deadline(self, coro: Coroutine[Any, Any, T], run_t0: float) -> T:
+        """Wrap a coro in the optional whole-run timeout.
+
+        Falls through unchanged when no timeout is configured. On
+        timeout we raise ``_Cancelled(TIMEOUT)`` to unwind cleanly so
+        the run still produces a structured ``AgentResult``.
+        """
+        run_timeout = self._config.run_timeout_s
+        if run_timeout is None:
+            return await coro
+        elapsed = time.perf_counter() - run_t0
+        remaining = run_timeout - elapsed
+        if remaining <= 0:
+            raise _Cancelled(CancelReason.TIMEOUT)
+        try:
+            return await asyncio.wait_for(coro, timeout=remaining)
+        except TimeoutError as e:
+            raise _Cancelled(CancelReason.TIMEOUT) from e
 
     # ---------- nodes ----------
 
     async def _retrieve(self, state: _State) -> None:
         t0 = time.perf_counter()
-        state.retrieval = await self._retriever.retrieve(state.query)
+        retrieval = await self._with_step_deadline(self._retriever.retrieve(state.query))
+        state.retrieval = retrieval
         elapsed = (time.perf_counter() - t0) * 1000.0
         state.trace.append(
             TraceEvent(
                 node=Node.CLASSIFY,
                 started_at=t0,
                 elapsed_ms=0.0,
-                detail=f"route={state.retrieval.route} confidence={state.retrieval.confidence:.2f}",
+                detail=f"route={retrieval.route} confidence={retrieval.confidence:.2f}",
             )
         )
         state.trace.append(
@@ -241,9 +416,30 @@ class Agent:
                 node=Node.RETRIEVE,
                 started_at=t0,
                 elapsed_ms=elapsed,
-                detail=f"chunks={len(state.retrieval.chunks)} extras={len(state.retrieval.extra_qualified_names)}",
+                detail=(
+                    f"chunks={len(retrieval.chunks)} extras={len(retrieval.extra_qualified_names)}"
+                ),
             )
         )
+        state.tool_calls.append(
+            ToolCall(
+                query=state.query,
+                route=retrieval.route,
+                n_chunks=len(retrieval.chunks),
+                elapsed_ms=elapsed,
+                confidence=retrieval.confidence,
+            )
+        )
+
+    async def _with_step_deadline(self, coro: Coroutine[Any, Any, T]) -> T:
+        """Wrap a single step in the per-step timeout (when configured)."""
+        step = self._config.step_timeout_s
+        if step is None:
+            return await coro
+        try:
+            return await asyncio.wait_for(coro, timeout=step)
+        except TimeoutError as e:
+            raise _Cancelled(CancelReason.TIMEOUT) from e
 
     async def _grade(self, state: _State) -> None:
         if state.retrieval is None:
@@ -292,7 +488,7 @@ class Agent:
     async def _answer(self, state: _State) -> tuple[str, list[Citation]]:
         chunks = state.retrieval.chunks if state.retrieval is not None else []
         t0 = time.perf_counter()
-        answer = await self._synth.synthesize(state.query, chunks)
+        answer = await self._with_step_deadline(self._synth.synthesize(state.query, chunks))
         elapsed = (time.perf_counter() - t0) * 1000.0
         state.trace.append(
             TraceEvent(
@@ -312,3 +508,25 @@ class Agent:
             for c in chunks
         ]
         return answer, citations
+
+    async def _validate(
+        self, state: _State, answer: str, citations: list[Citation]
+    ) -> ValidationReport:
+        chunks = state.retrieval.chunks if state.retrieval is not None else []
+        t0 = time.perf_counter()
+        report = await self._with_step_deadline(
+            self._validator.validate(state.query, answer, chunks)
+        )
+        elapsed = (time.perf_counter() - t0) * 1000.0
+        state.trace.append(
+            TraceEvent(
+                node=Node.VALIDATE,
+                started_at=t0,
+                elapsed_ms=elapsed,
+                detail=(
+                    f"claims={report.n_claims} grounded={report.n_grounded} "
+                    f"acceptable={report.is_acceptable}"
+                ),
+            )
+        )
+        return report

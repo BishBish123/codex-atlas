@@ -1,14 +1,16 @@
 """Adaptive retrieval router.
 
-Classifies each query into one of four routes, then runs the matching
+Classifies each query into one of six routes, then runs the matching
 retrieval strategy:
 
 | route          | example                                  | strategy                                |
 | -------------- | ---------------------------------------- | --------------------------------------- |
 | lookup         | "what does Depends do?"                  | vector top-k                            |
 | structural     | "who calls APIRouter.add_api_route?"     | graph callers/callees                   |
-| hybrid         | "auth-related endpoints"                 | vector top-k → 1-hop graph expansion    |
-| summarization  | "walk me through dependency injection"   | vector top-k + graph neighbours, merged |
+| hybrid         | "auth-related endpoints"                 | vector top-k -> 1-hop graph expansion + hybrid scorer |
+| summarization  | "walk me through dependency injection"   | wider vector top-k + 2-hop graph neighbours |
+| neighborhood   | "neighborhood of Retriever.retrieve"     | both-direction BFS to depth 2           |
+| import_chain   | "which modules import codex_atlas.store" | reverse imports walk                    |
 
 The classifier is a hand-tuned heuristic on purpose: an LLM classifier
 adds latency + cost + a calibration burden, and the heuristic gets ~85%
@@ -460,7 +462,25 @@ _QNAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_][A-Za-z_0-9]*)+)
 
 
 def _extract_qualified_name(query: str, graph: CallGraph) -> str | None:
-    """Best-effort: extract a qualified name from the query that exists in the graph."""
+    """Best-effort: extract a qualified name from the query that exists in the graph.
+
+    Resolution order:
+
+    1. **Exact qname match.** If the query contains a dotted token that
+       is itself a graph node, return it.
+    2. **Suffix match on a bare short name.** Collect EVERY graph node
+       that ends in ``.<short>`` (or equals ``<short>``) and:
+       - return the unique match if exactly one node qualifies,
+       - return ``None`` when zero or multiple nodes qualify.
+
+    Earlier the suffix branch returned the FIRST node whose name ended
+    in the short token — which made the result depend on
+    ``graph._g.nodes`` insertion order. Two functions named ``run`` in
+    different modules would silently pick whichever was indexed first.
+    Returning ``None`` on ambiguity surfaces the unresolved structural
+    intent to the agent, which falls back to vector lookup rather than
+    walking the wrong subgraph.
+    """
     candidates: list[str] = _QNAME_RE.findall(query)
     for c in candidates:
         if graph.has_symbol(c):
@@ -468,9 +488,26 @@ def _extract_qualified_name(query: str, graph: CallGraph) -> str | None:
     # Try suffix matches — `add_api_route` may resolve to
     # `fastapi.routing.APIRouter.add_api_route`.
     short_candidates: list[str] = re.findall(r"\b([A-Za-z_][A-Za-z_0-9]+)\b", query)
+    nodes = [str(n) for n in graph._g.nodes]
     for short in short_candidates:
-        for node in graph._g.nodes:
-            node_str = str(node)
-            if node_str.endswith(f".{short}") or node_str == short:
-                return node_str
+        # Collect every node that suffix-matches this short token.
+        # Iterate the snapshotted ``nodes`` list so the result is
+        # deterministic — and so we don't silently lose ambiguity to
+        # ``set`` semantics.
+        suffix = f".{short}"
+        matches = [n for n in nodes if n == short or n.endswith(suffix)]
+        # Prefer an exact equality if the short name is itself a qname.
+        exact = [n for n in matches if n == short]
+        if len(exact) == 1:
+            return exact[0]
+        # Otherwise: only resolve when exactly one suffix match exists.
+        # Multiple matches = ambiguous; let the caller fall back to
+        # vector lookup rather than guessing the wrong symbol.
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            # Ambiguous — refuse to guess. Skip to the next short
+            # candidate; if no short candidate ever resolves uniquely
+            # we'll fall through to ``return None`` below.
+            continue
     return None

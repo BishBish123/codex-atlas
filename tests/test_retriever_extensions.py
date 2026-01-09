@@ -355,6 +355,79 @@ class TestHybridScoreZeroCosine:
         assert out[1].cosine == 0.0
 
 
+class TestExtractQualifiedNameAmbiguity:
+    """Short-name extraction must reject ambiguous matches deterministically.
+
+    Earlier ``_extract_qualified_name`` returned the first node whose
+    qualified name ended in the bare short token, which made the result
+    depend on graph node insertion order. Two functions named ``run`` in
+    different modules silently picked whichever was indexed first.
+    """
+
+    def _graph_with_two_runs(self) -> CallGraph:
+        g = CallGraph()
+        g.ingest(
+            [
+                ParsedFile(
+                    file_path="a.py",
+                    module_name="a",
+                    symbols=[_sym("a"), _sym("a.run")],
+                    chunks=[],
+                    imports=[],
+                    calls=[],
+                ),
+                ParsedFile(
+                    file_path="b.py",
+                    module_name="b",
+                    symbols=[_sym("b"), _sym("b.run")],
+                    chunks=[],
+                    imports=[],
+                    calls=[],
+                ),
+            ]
+        )
+        return g
+
+    async def test_ambiguous_short_name_falls_back_to_lookup(self) -> None:
+        # Both ``a.run`` and ``b.run`` end in ``.run``; the structural
+        # extractor must refuse to guess and the retriever must fall
+        # back to vector lookup.
+        g = self._graph_with_two_runs()
+        store = AsyncMock()
+        store.search.return_value = [_stored("a.run")]
+        r = Retriever(FakeEncoder(dim=8), store, g, RetrieverConfig(top_k=2))
+        result = await r.retrieve("who calls run")
+        # Classifier still picks structural by phrasing.
+        assert result.route is Route.STRUCTURAL
+        # But the extractor refused to resolve — fall back to vector.
+        store.search.assert_awaited_once()
+        # No structural extras leaked because no qname was selected.
+        assert result.extra_qualified_names == []
+
+    async def test_unique_short_name_still_resolves(self) -> None:
+        # Only one node ends in ``.run``; resolution should still work.
+        g = CallGraph()
+        g.ingest(
+            [
+                ParsedFile(
+                    file_path="a.py",
+                    module_name="a",
+                    symbols=[_sym("a"), _sym("a.run"), _sym("a.helper")],
+                    chunks=[],
+                    imports=[],
+                    calls=[("a.helper", "run")],
+                )
+            ]
+        )
+        store = AsyncMock()
+        store.fetch_by_qualified_name.side_effect = _stored
+        r = Retriever(FakeEncoder(dim=8), store, g, RetrieverConfig(top_k=4))
+        result = await r.retrieve("who calls run")
+        assert result.route is Route.STRUCTURAL
+        # Extras include the resolved target.
+        assert "a.run" in result.extra_qualified_names
+
+
 class TestRouteOverride:
     """Explicit ``route_override`` skips the classifier and runs the named route."""
 

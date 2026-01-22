@@ -245,6 +245,50 @@ class TestHybridUsesScorer:
         # Highest-cosine seed wins regardless of original ordering.
         assert result.chunks[0].qualified_name == "m.b"
 
+    async def test_hybrid_route_chunks_carry_combined_score(self) -> None:
+        # Hybrid-route citations must expose the blended hybrid score the
+        # route used to rank — NOT the original cosine on the seed (or
+        # the ``0.0`` graph-only sentinel on graph-expanded hits).
+        # Earlier ``_hybrid`` reordered the original chunks by hybrid
+        # rank but returned them with their pre-rank ``StoredChunk.score``
+        # untouched, so downstream consumers (citations, MCP responses,
+        # any re-ranker) received the wrong signal.
+        seeds = [_stored("m.a", score=0.5, text="alpha")]
+        store = AsyncMock()
+        store.search.return_value = seeds
+        # Graph-expanded hits arrive with score=0.0 (the no-cosine
+        # sentinel). After the hybrid scorer runs they must come back
+        # with a positive blended score.
+        store.fetch_by_qualified_name.side_effect = lambda q: _stored(
+            q, score=0.0, text=""
+        )
+        r = Retriever(
+            FakeEncoder(dim=8),
+            store,
+            _mk_graph(),
+            RetrieverConfig(
+                top_k=3,
+                graph_depth=1,
+                hybrid_weight_cosine=0.5,
+                hybrid_weight_graph=0.5,
+                hybrid_weight_fulltext=0.0,
+            ),
+        )
+        result = await r.retrieve("show me all auth-related code")
+        assert result.route is Route.HYBRID
+        # The seed had cosine=0.5; the graph neighbour had score=0.0
+        # before scoring. After scoring, both must carry positive
+        # blended scores derived from cosine + graph distance.
+        assert result.chunks, "hybrid route returned no chunks"
+        for c in result.chunks:
+            assert c.score > 0.0, (
+                f"chunk {c.qualified_name} kept pre-rank score "
+                f"{c.score!r}; expected blended hybrid score"
+            )
+        # And the score must be monotone with rank.
+        scores = [c.score for c in result.chunks]
+        assert scores == sorted(scores, reverse=True)
+
     async def test_hybrid_score_decays_with_graph_depth(self) -> None:
         # Graph: m.a -> m.b -> m.c. Seed is m.a only. With
         # ``graph_depth=2`` the 1-hop neighbour ``m.b`` and the 2-hop

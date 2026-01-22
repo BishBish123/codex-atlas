@@ -21,7 +21,7 @@ plateaus.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from codex_atlas.embed import Encoder
@@ -396,10 +396,22 @@ class Retriever:
             graph_distances=graph_distances,
             weights=weights,
         )
-        # Reorder ``candidates`` to match the ranked output, keep top-k.
-        order = {s.qualified_name: i for i, s in enumerate(scored)}
-        candidates.sort(key=lambda c: order.get(c.qualified_name, len(order)))
-        return candidates[: self._config.top_k], expansions
+        # Rebuild the candidate list in scored order AND swap each
+        # chunk's ``score`` for the blended hybrid score the route
+        # actually used to rank. Returning the original ``StoredChunk``
+        # leaked the raw cosine (or the ``0.0`` graph-only sentinel) at
+        # the MCP/CLI boundary even though ranking happened on the
+        # combined score — citations could not surface the real route
+        # confidence and downstream re-rankers received the wrong
+        # signal.
+        by_qname = {c.qualified_name: c for c in candidates}
+        ranked: list[StoredChunk] = []
+        for s in scored:
+            base = by_qname.get(s.qualified_name)
+            if base is None:
+                continue
+            ranked.append(replace(base, score=s.combined))
+        return ranked[: self._config.top_k], expansions
 
     async def _summarization(self, query: str) -> tuple[list[StoredChunk], list[str]]:
         # Pull a wider net, then expand 2 hops via graph neighbours so

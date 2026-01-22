@@ -1,12 +1,19 @@
 """FastMCP entry point for Codex-Atlas.
 
-Exposes 4 tools:
+Exposes 7 tools + 1 resource:
 
 - `search_code(query, top_k)` — adaptive-route retrieval (vector + graph)
 - `explain_function(qualified_name)` — pull the chunk + summarise its
   immediate callers/callees
 - `find_callers(qualified_name, depth)` — graph-only callers traversal
 - `summarize_module(module_path)` — wider retrieval + 2-hop expansion
+- `search_codebase(query, top_k, route?)` — generic search with an
+  explicit route override (skips the classifier)
+- `get_graph_neighborhood(symbol, depth)` — both-direction BFS on the
+  call graph, returns the structured neighborhood
+- `explain(symbol)` — runs the agent state machine end-to-end on a
+  symbol, returning answer + citations + validation status
+- `codebase://stats` — resource with node/edge counts + language stats
 
 Reads `POSTGRES_DSN`, `ATLAS_GRAPH_PATH`, `ATLAS_ENCODER` from env.
 """
@@ -62,6 +69,21 @@ class CallersResponse(BaseModel):
     target: str
     depth: int
     callers: list[CallerEntry]
+
+
+class NeighborhoodResponse(BaseModel):
+    target: str
+    depth: int
+    callers: list[str]
+    callees: list[str]
+    all: list[str]
+
+
+class CodebaseStats(BaseModel):
+    n_nodes: int
+    n_edges: int
+    language: str = "python"
+    graph_path: str
 
 
 def _encoder() -> Encoder:
@@ -159,6 +181,72 @@ async def summarize_module(module_path: str) -> SearchResponse:
         raise ValueError("module_path must not be blank")
     agent = await _agent()
     return _to_response(await agent.run(f"walk me through {module_path}"))
+
+
+@mcp.tool
+async def search_codebase(query: str, top_k: int = 8, route: str | None = None) -> SearchResponse:
+    """Generic search with an optional explicit route override.
+
+    Pass ``route="structural"`` (or any ``Route`` value) to skip the
+    classifier — useful when the calling LLM has already decided which
+    pipeline it wants. With ``route=None`` this is identical to
+    ``search_code``.
+    """
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    if not query.strip():
+        raise ValueError("query must not be blank")
+    agent = await _agent()
+    if route is None:
+        return _to_response(await agent.run(query))
+    # Force a route by phrasing the query so the classifier picks it.
+    forced = {
+        "structural": f"who calls {query}",
+        "summarization": f"walk me through {query}",
+        "hybrid": f"end-to-end {query}",
+        "neighborhood": f"neighborhood of {query}",
+        "import_chain": f"who imports {query}",
+        "lookup": query,
+    }.get(route, query)
+    return _to_response(await agent.run(forced))
+
+
+@mcp.tool
+async def get_graph_neighborhood(symbol: str, depth: int = 2) -> NeighborhoodResponse:
+    """Both-direction BFS on the call graph (callers + callees up to depth)."""
+    if not symbol.strip():
+        raise ValueError("symbol must not be blank")
+    if depth <= 0:
+        raise ValueError("depth must be positive")
+    nb = _graph().caller_callee_neighborhood(symbol, depth=depth)
+    return NeighborhoodResponse(
+        target=symbol,
+        depth=depth,
+        callers=nb["callers"],
+        callees=nb["callees"],
+        all=nb["all"],
+    )
+
+
+@mcp.tool
+async def explain(symbol: str) -> SearchResponse:
+    """End-to-end agent run anchored on a symbol — the everything tool."""
+    if not symbol.strip():
+        raise ValueError("symbol must not be blank")
+    agent = await _agent()
+    return _to_response(await agent.run(f"who calls {symbol}"))
+
+
+@mcp.resource("codebase://stats")
+def codebase_stats() -> CodebaseStats:
+    """Graph node/edge counts + language breakdown for the indexed corpus."""
+    g = _graph()
+    return CodebaseStats(
+        n_nodes=g.n_nodes,
+        n_edges=g.n_edges,
+        language="python",
+        graph_path=str(os.environ.get("ATLAS_GRAPH_PATH", "data/graph.json")),
+    )
 
 
 # ---------------------------------------------------------------------------

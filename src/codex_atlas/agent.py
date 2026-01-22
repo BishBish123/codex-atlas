@@ -224,10 +224,16 @@ class _State:
     # Set when the caller wants to skip classification for this run.
     route_override: Route | None = None
     # The node currently executing — set when a node body starts and
-    # cleared when it finishes. The agent appends a ``Node.CANCEL``
-    # event after a timeout, so the MCP boundary cannot reliably infer
-    # the timed-out phase from ``trace[-1]``. ``in_flight_node`` is the
-    # source of truth for "what was running when the deadline fired".
+    # cleared back to ``None`` when it returns successfully. The agent
+    # appends a ``Node.CANCEL`` event after a timeout, so the MCP
+    # boundary cannot reliably infer the timed-out phase from
+    # ``trace[-1]``. ``in_flight_node`` is the source of truth for
+    # "what was running when the deadline fired" — and ``None`` is the
+    # correct answer when the deadline fires *between* node bodies
+    # (e.g. ``run_timeout_s`` exhausted right after ``_retrieve``
+    # returned but before ``_grade`` started). Without the explicit
+    # clear, a between-node timeout would leak the previous node's
+    # value, surfacing a stale ``cancelled_node``.
     in_flight_node: Node | None = None
 
 
@@ -691,6 +697,12 @@ class Agent:
                 confidence=retrieval.confidence,
             )
         )
+        # Clear the in-flight marker so a deadline tripping BETWEEN this
+        # node and the next does not surface a stale phase via
+        # ``cancelled_node``. A timeout fired by ``_with_run_deadline``
+        # before the next node sets the marker should report ``None``
+        # (idle), not ``Node.RETRIEVE``.
+        state.in_flight_node = None
 
     async def _with_step_deadline(self, coro: Coroutine[Any, Any, T]) -> T:
         """Wrap a single step in the per-step timeout (when configured)."""
@@ -729,6 +741,7 @@ class Agent:
                 detail=f"grade={state.grade:.2f}",
             )
         )
+        state.in_flight_node = None
 
     async def _rewrite(self, state: _State) -> None:
         if state.retrieval is None:
@@ -747,6 +760,7 @@ class Agent:
         )
         state.query = new_query
         state.attempts += 1
+        state.in_flight_node = None
 
     async def _answer(self, state: _State) -> tuple[str, list[Citation]]:
         chunks = state.retrieval.chunks if state.retrieval is not None else []
@@ -773,6 +787,7 @@ class Agent:
             )
             for c in chunks
         ]
+        state.in_flight_node = None
         return answer, citations
 
     async def _validate(
@@ -796,6 +811,7 @@ class Agent:
                 ),
             )
         )
+        state.in_flight_node = None
         return report
 
     @staticmethod

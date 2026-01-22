@@ -305,6 +305,95 @@ class TestCancelOnTimeout:
         # avoided is reading the phase from there.
         assert result.trace[-1].node is Node.CANCEL
 
+    async def test_node_bodies_clear_in_flight_marker_on_exit(self) -> None:
+        # Regression: ``_with_run_deadline`` checks the deadline BEFORE
+        # entering the next node body. If a node finishes cleanly but
+        # the run-deadline has already elapsed, the wrapper raises
+        # ``_Cancelled`` *before* the next node sets the marker. Without
+        # an explicit clear at the END of each node body, the previous
+        # node's ``state.in_flight_node`` would leak into
+        # ``cancelled_node`` and surface a stale phase to MCP clients.
+        #
+        # Timing-based tests for this race are flaky (the run-deadline
+        # also wraps the same node, so ``wait_for`` may cancel the node
+        # mid-flight instead of producing the between-node window we
+        # want). Test the invariant directly: after each node body
+        # returns successfully, ``state.in_flight_node`` is ``None``.
+        from codex_atlas.agent import _State  # noqa: PLC0415  # private
+
+        retriever = StubRetriever(responses=[_result([_stored("m.foo")])])
+        agent = Agent(retriever)  # type: ignore[arg-type]
+
+        # _retrieve clears the marker on success.
+        state = _State(original_query="q", query="q")
+        await agent._retrieve(state)
+        assert state.in_flight_node is None
+        assert state.retrieval is not None  # body actually ran
+
+        # _grade clears the marker on success.
+        await agent._grade(state)
+        assert state.in_flight_node is None
+
+        # _rewrite clears the marker on success.
+        await agent._rewrite(state)
+        assert state.in_flight_node is None
+
+        # _answer clears the marker on success.
+        await agent._answer(state)
+        assert state.in_flight_node is None
+
+        # _validate clears the marker on success.
+        await agent._validate(state, "ans", [])
+        assert state.in_flight_node is None
+
+    async def test_between_node_timeout_surfaces_no_stale_phase(self) -> None:
+        # End-to-end variant of the in_flight_node-clear regression.
+        # Force a real between-node timeout by stubbing the agent's
+        # ``_with_run_deadline`` so the FIRST call (``_retrieve``)
+        # passes through but the SECOND (``_grade``) raises
+        # ``_Cancelled(TIMEOUT)`` *before* invoking the inner coro —
+        # exactly the shape ``_with_run_deadline`` produces when the
+        # run-deadline has already elapsed (``remaining <= 0``). This
+        # exercises the between-node window the timing-based race
+        # (``run_timeout_s ≈ retriever.delay_s``) couldn't reach
+        # deterministically.
+        from codex_atlas.agent import CancelReason as _CR  # noqa: PLC0415
+        from codex_atlas.agent import _Cancelled  # noqa: PLC0415
+
+        retriever = StubRetriever(responses=[_result([_stored("m.foo")])])
+        agent = Agent(retriever)  # type: ignore[arg-type]
+
+        original_with_run_deadline = agent._with_run_deadline
+        call_count = {"n": 0}
+
+        async def fake_with_run_deadline(coro, run_t0):  # type: ignore[no-untyped-def]
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # First call wraps _retrieve — pass through cleanly so
+                # _retrieve sets the marker and clears it on exit.
+                return await original_with_run_deadline(coro, run_t0)
+            # Second call wraps _grade — simulate the run-deadline
+            # having elapsed BEFORE grade ever runs. Crucially, we
+            # close the inner coro so it never executes (no marker
+            # mutation), then raise the same _Cancelled the real
+            # wrapper would.
+            coro.close()
+            raise _Cancelled(_CR.TIMEOUT)
+
+        agent._with_run_deadline = fake_with_run_deadline  # type: ignore[method-assign]
+        result = await agent.run("q")
+        assert result.cancelled is CancelReason.TIMEOUT
+        # The between-node timeout reports no specific phase. Without
+        # the explicit ``state.in_flight_node = None`` at the end of
+        # ``_retrieve`` this would leak ``Node.RETRIEVE``.
+        assert result.cancelled_node is None
+        # Sanity: ``_retrieve`` actually finished — its trace event is
+        # present, then the cancel marker. Without that sanity, the
+        # test could pass simply because no node ever ran.
+        node_sequence = [ev.node for ev in result.trace]
+        assert Node.RETRIEVE in node_sequence
+        assert node_sequence[-1] is Node.CANCEL
+
 
 @dataclass
 class _RejectingValidator:

@@ -9,19 +9,27 @@ Metrics (no LLM required so the harness runs in CI):
   gold (or partial-suffix-match) gold name
 - `latency_ms` — wall-clock per question
 - `attempts` — how many re-query loops the agent took
+- `tool_calls` — how many retriever invocations per question
+- `cost_estimate_usd` — token count x model price (approximation)
+
+Aggregate-level the harness also reports `latency_p99` and a
+``failure_taxonomy`` bucket-count so a senior reviewer can see *why*
+the harness is missing answers, not just *that* it is.
 
 Anything LLM-dependent (faithfulness, answer-relevancy) lives behind a
 `Grader` plug point and is *not* required to make the harness green —
 that keeps it portable while leaving room for the production LLM judge
-to drop in. Note: this module is named `harness` in the `eval` package,
-not the Python builtin `eval()` (which is not used anywhere here).
+to drop in.
 """
 
 from __future__ import annotations
 
+import json
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
 from codex_atlas.agent import Agent, AgentResult
 from codex_atlas.retriever import Route
@@ -43,6 +51,26 @@ class EvalQuestion:
     gold_qualified_names: list[str] = field(default_factory=list)
 
 
+class FailureBucket(StrEnum):
+    """Why an answer was wrong / unsatisfying. One per question, max."""
+
+    NONE = "none"
+    MISSING_NODE = "missing_node"  # gold qname not in graph at all
+    WRONG_ROUTE = "wrong_route"  # classifier picked the wrong route
+    HALLUCINATED = "hallucinated"  # cited qname not in retrieved chunks
+    PARTIAL = "partial"  # some gold cited, some missed
+    UNGROUNDED = "ungrounded"  # answer cites nothing
+    OFF_TOPIC = "off_topic"  # citations match no gold name
+    OUTDATED_INDEX = "outdated_index"  # answer references stale state
+
+
+# Token / pricing approximation for `cost_estimate_usd`. The numbers are
+# illustrative — tweak them per provider — and live here rather than at
+# call sites so a single edit covers every metric report.
+DEFAULT_PRICE_USD_PER_1K_INPUT = 0.0030
+DEFAULT_PRICE_USD_PER_1K_OUTPUT = 0.0150
+
+
 @dataclass(frozen=True)
 class EvalResult:
     qid: str
@@ -57,6 +85,10 @@ class EvalResult:
     attempts: int
     answer_preview: str
     cited_qualified_names: list[str]
+    tool_call_count: int = 0
+    cost_estimate_usd: float = 0.0
+    failure_bucket: FailureBucket = FailureBucket.NONE
+    answer_full: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +97,12 @@ class EvalResult:
 
 
 def score_result(
-    question: EvalQuestion, agent_result: AgentResult, latency_ms: float
+    question: EvalQuestion,
+    agent_result: AgentResult,
+    latency_ms: float,
+    *,
+    price_input: float = DEFAULT_PRICE_USD_PER_1K_INPUT,
+    price_output: float = DEFAULT_PRICE_USD_PER_1K_OUTPUT,
 ) -> EvalResult:
     cited = [c.qualified_name for c in agent_result.citations]
 
@@ -90,6 +127,21 @@ def score_result(
     else:
         precision = 1.0 if not question.gold_qualified_names else 0.0
 
+    bucket = _classify_failure(
+        question=question,
+        cited=cited,
+        recall=recall,
+        precision=precision,
+        route_correct=route_correct,
+        answer=agent_result.answer,
+    )
+    cost = _estimate_cost_usd(
+        question=question.question,
+        answer=agent_result.answer,
+        price_input=price_input,
+        price_output=price_output,
+    )
+
     return EvalResult(
         qid=question.qid,
         category=question.category,
@@ -103,7 +155,62 @@ def score_result(
         attempts=agent_result.attempts,
         answer_preview=agent_result.answer[:160].replace("\n", " "),
         cited_qualified_names=cited,
+        tool_call_count=len(agent_result.tool_calls),
+        cost_estimate_usd=cost,
+        failure_bucket=bucket,
+        answer_full=agent_result.answer,
     )
+
+
+def _classify_failure(  # noqa: PLR0911
+    *,
+    question: EvalQuestion,
+    cited: list[str],
+    recall: float,
+    precision: float,
+    route_correct: bool,
+    answer: str,
+) -> FailureBucket:
+    """Bucket a question into the 7-mode failure taxonomy.
+
+    Order matters: we report the first bucket that matches so a single
+    failure is never double-counted. ``OUTDATED_INDEX`` is detected
+    heuristically from the agent's answer text — production swaps this
+    for a real freshness signal (commit-sha drift on the chunks).
+    """
+    # Refusal questions: gold is empty, so recall=1.0 means correct refusal.
+    if not question.gold_qualified_names:
+        if cited:
+            return FailureBucket.OFF_TOPIC
+        return FailureBucket.NONE
+
+    if "stale" in answer.lower() or "outdated" in answer.lower():
+        return FailureBucket.OUTDATED_INDEX
+    if not route_correct:
+        return FailureBucket.WRONG_ROUTE
+    if not cited:
+        return FailureBucket.UNGROUNDED
+    if recall == 0.0 and precision == 0.0:
+        return FailureBucket.OFF_TOPIC
+    if 0.0 < recall < 1.0:
+        return FailureBucket.PARTIAL
+    if precision < 0.5 and recall >= 1.0:
+        # Got everything we wanted but also produced unsupported names.
+        return FailureBucket.HALLUCINATED
+    return FailureBucket.NONE
+
+
+def _estimate_cost_usd(
+    *,
+    question: str,
+    answer: str,
+    price_input: float,
+    price_output: float,
+) -> float:
+    """Token-count approximation: ~4 chars / token, then multiply by price."""
+    in_tokens = max(1, len(question) // 4)
+    out_tokens = max(1, len(answer) // 4)
+    return (in_tokens / 1000.0) * price_input + (out_tokens / 1000.0) * price_output
 
 
 def _matches(gold: str, cited: list[str]) -> bool:
@@ -136,6 +243,40 @@ async def run_eval(agent: Agent, questions: list[EvalQuestion]) -> list[EvalResu
     return out
 
 
+def aggregate(results: list[EvalResult]) -> dict[str, float | int]:
+    """Compute every aggregate metric without rendering markdown.
+
+    Convenient for ``evaluate_against_baseline`` and for tests that
+    don't want to parse the report. Numbers track ``render_report``
+    output exactly.
+    """
+    if not results:
+        return {}
+    n = len(results)
+    latencies = sorted(r.latency_ms for r in results)
+    return {
+        "n": n,
+        "route_correctness": sum(1 for r in results if r.route_correct) / n,
+        "citation_recall_mean": sum(r.citation_recall for r in results) / n,
+        "citation_precision_mean": sum(r.citation_precision for r in results) / n,
+        "latency_p50_ms": latencies[n // 2],
+        "latency_p95_ms": latencies[max(0, int(n * 0.95) - 1)],
+        "latency_p99_ms": latencies[max(0, int(n * 0.99) - 1)],
+        "tool_call_count_mean": sum(r.tool_call_count for r in results) / n,
+        "cost_estimate_usd_total": sum(r.cost_estimate_usd for r in results),
+    }
+
+
+def failure_taxonomy_counts(results: list[EvalResult]) -> dict[str, int]:
+    """Count how many questions landed in each failure bucket."""
+    counts: Counter[str] = Counter()
+    for bucket in FailureBucket:
+        counts[str(bucket)] = 0
+    for r in results:
+        counts[str(r.failure_bucket)] += 1
+    return dict(counts)
+
+
 def render_report(results: list[EvalResult]) -> str:
     """Markdown report summarising the run."""
     if not results:
@@ -145,22 +286,23 @@ def render_report(results: list[EvalResult]) -> str:
     for r in results:
         by_category.setdefault(r.category, []).append(r)
 
-    lines = ["# Codex-Atlas eval report", ""]
+    agg = aggregate(results)
     n = len(results)
-    route_acc = sum(1 for r in results if r.route_correct) / n
-    avg_recall = sum(r.citation_recall for r in results) / n
-    avg_precision = sum(r.citation_precision for r in results) / n
-    p50_latency = sorted(r.latency_ms for r in results)[n // 2]
+    lines = ["# Codex-Atlas eval report", ""]
     lines += [
         "## Headline",
         "",
         "| Metric | Value |",
         "| --- | ---: |",
         f"| Questions | {n} |",
-        f"| Route correctness | {route_acc:.1%} |",
-        f"| Citation recall (mean) | {avg_recall:.2f} |",
-        f"| Citation precision (mean) | {avg_precision:.2f} |",
-        f"| p50 latency (ms) | {p50_latency:.1f} |",
+        f"| Route correctness | {agg['route_correctness']:.1%} |",
+        f"| Citation recall (mean) | {agg['citation_recall_mean']:.2f} |",
+        f"| Citation precision (mean) | {agg['citation_precision_mean']:.2f} |",
+        f"| p50 latency (ms) | {agg['latency_p50_ms']:.1f} |",
+        f"| p95 latency (ms) | {agg['latency_p95_ms']:.1f} |",
+        f"| p99 latency (ms) | {agg['latency_p99_ms']:.1f} |",
+        f"| Tool calls / q (mean) | {agg['tool_call_count_mean']:.2f} |",
+        f"| Cost estimate (USD, total) | {agg['cost_estimate_usd_total']:.4f} |",
         "",
     ]
 
@@ -176,17 +318,145 @@ def render_report(results: list[EvalResult]) -> str:
         lines.append(f"| {cat} | {len(rs)} | {cat_acc:.0%} | {cat_recall:.2f} | {cat_prec:.2f} |")
     lines += [""]
 
+    counts = failure_taxonomy_counts(results)
+    lines += ["## Failure taxonomy", ""]
+    lines += [
+        "| Bucket | Count |",
+        "| --- | ---: |",
+    ]
+    for bucket, count in counts.items():
+        lines.append(f"| {bucket} | {count} |")
+    lines += [""]
+
     lines += ["## Per question", ""]
     lines += [
-        "| qid | route ok | recall | prec | ms | attempts | preview |",
-        "| --- | :---: | ---: | ---: | ---: | ---: | --- |",
+        "| qid | route ok | recall | prec | ms | tools | bucket | preview |",
+        "| --- | :---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for r in results:
         check = "yes" if r.route_correct else "no"
         lines.append(
             f"| {r.qid} | {check} | {r.citation_recall:.2f} | "
             f"{r.citation_precision:.2f} | {r.latency_ms:.1f} | "
-            f"{r.attempts} | {r.answer_preview[:80]} |"
+            f"{r.tool_call_count} | {r.failure_bucket} | {r.answer_preview[:80]} |"
         )
 
     return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Baseline regression
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BaselineDiff:
+    """A baseline-vs-current diff suitable for a CI gate.
+
+    `regressions` lists metrics that got worse beyond the tolerance.
+    `improvements` lists metrics that got better. `unchanged` is silent
+    by design (CI doesn't need to celebrate flat numbers).
+    """
+
+    regressions: dict[str, tuple[float, float]]  # metric -> (baseline, current)
+    improvements: dict[str, tuple[float, float]]
+    is_regression: bool
+
+
+# Metrics that should be *higher* in the new run than in the baseline.
+_HIGHER_IS_BETTER: frozenset[str] = frozenset(
+    {
+        "route_correctness",
+        "citation_recall_mean",
+        "citation_precision_mean",
+    }
+)
+# Metrics that should be *lower*.
+_LOWER_IS_BETTER: frozenset[str] = frozenset(
+    {
+        "latency_p50_ms",
+        "latency_p95_ms",
+        "latency_p99_ms",
+        "tool_call_count_mean",
+        "cost_estimate_usd_total",
+    }
+)
+
+
+def evaluate_against_baseline(
+    current: list[EvalResult],
+    baseline_path: str | Path,
+    *,
+    tolerance: float = 0.05,
+) -> BaselineDiff:
+    """Diff `current` against a saved baseline JSON; flag regressions.
+
+    Tolerance is a fraction of the baseline value: a 5% tolerance means
+    a metric that drops by less than 5% of its baseline doesn't count as
+    a regression. This keeps the CI gate from blocking on noise while
+    still surfacing real drift.
+    """
+    baseline = json.loads(Path(baseline_path).read_text())
+    cur = aggregate(current)
+    regressions: dict[str, tuple[float, float]] = {}
+    improvements: dict[str, tuple[float, float]] = {}
+    # Only diff metrics the baseline actually recorded — you can't regress
+    # against a number you didn't measure.
+    for metric in _HIGHER_IS_BETTER:
+        if metric not in baseline:
+            continue
+        b = float(baseline[metric])
+        c = float(cur.get(metric, 0.0))
+        if c < b - tolerance * max(abs(b), 1e-9):
+            regressions[metric] = (b, c)
+        elif c > b + tolerance * max(abs(b), 1e-9):
+            improvements[metric] = (b, c)
+    for metric in _LOWER_IS_BETTER:
+        if metric not in baseline:
+            continue
+        b = float(baseline[metric])
+        c = float(cur.get(metric, 0.0))
+        if c > b + tolerance * max(abs(b), 1e-9):
+            regressions[metric] = (b, c)
+        elif c < b - tolerance * max(abs(b), 1e-9):
+            improvements[metric] = (b, c)
+    return BaselineDiff(
+        regressions=regressions,
+        improvements=improvements,
+        is_regression=bool(regressions),
+    )
+
+
+def write_failure_report(results: list[EvalResult], path: str | Path) -> Path:
+    """Write a JSONL per-question dump for manual debugging.
+
+    One line per question, full answer + every cited qname + the
+    failure bucket. Designed for `cat path | jq` workflows.
+    """
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w") as fh:
+        for r in results:
+            fh.write(
+                json.dumps(
+                    {
+                        "qid": r.qid,
+                        "category": r.category,
+                        "question": r.question,
+                        "expected_route": str(r.expected_route),
+                        "actual_route": str(r.actual_route),
+                        "route_correct": r.route_correct,
+                        "citation_recall": r.citation_recall,
+                        "citation_precision": r.citation_precision,
+                        "latency_ms": r.latency_ms,
+                        "attempts": r.attempts,
+                        "tool_call_count": r.tool_call_count,
+                        "cost_estimate_usd": r.cost_estimate_usd,
+                        "failure_bucket": str(r.failure_bucket),
+                        "cited_qualified_names": r.cited_qualified_names,
+                        "answer": r.answer_full,
+                    }
+                )
+                + "\n"
+            )
+    return out

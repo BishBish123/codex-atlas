@@ -267,9 +267,18 @@ def _to_response(result: AgentResult) -> SearchResponse | AgentTimeoutResponse:
     normal ``SearchResponse``.
     """
     if result.cancelled is CancelReason.TIMEOUT:
-        # Identify the last node that was executing when the deadline fired.
-        phase = result.trace[-1].node if result.trace else "unknown"
-        return AgentTimeoutResponse(error="agent_timeout", phase=str(phase))
+        # ``Agent.run`` records ``Node.CANCEL`` AFTER the timeout fires,
+        # so ``trace[-1]`` is always ``cancel`` for a real timeout —
+        # using it as the phase produced misleading "phase=cancel"
+        # responses that hid which step actually hit the deadline. The
+        # agent now tracks the in-flight node explicitly on its result
+        # (``AgentResult.cancelled_node``); fall through to the trace
+        # only for older results that predate the field.
+        if result.cancelled_node is not None:
+            phase = str(result.cancelled_node)
+        else:
+            phase = str(result.trace[-1].node) if result.trace else "unknown"
+        return AgentTimeoutResponse(error="agent_timeout", phase=phase)
     # Surface the per-chunk score + text the agent threaded through the
     # ``Citation`` record. Earlier the MCP layer hardcoded score=0.0 and
     # text="" — the schema advertised score: float and text: str but

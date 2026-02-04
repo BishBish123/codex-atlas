@@ -467,6 +467,85 @@ class TestCodeSearchHitScoreAndText:
         assert resp.citations[1].text == "def bar():\n    return 2\n"
 
 
+class TestMcpAgentTimeoutPhaseFromCancelledNode:
+    """The MCP timeout response must read phase from
+    ``AgentResult.cancelled_node`` — NOT ``trace[-1]``.
+
+    `Agent.run` appends ``Node.CANCEL`` to the trace AFTER the timeout
+    fires, so a real timed-out run has ``trace[-1].node == "cancel"``.
+    Reading phase from there hid which step actually hit the deadline.
+    """
+
+    async def test_phase_uses_cancelled_node_over_trace_last(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from codex_atlas.agent import Node  # noqa: PLC0415
+
+        async def fake_agent(top_k: int = 8) -> _StubAgent:
+            agent = _StubAgent()
+
+            async def _run(
+                query: str, *, route_override: Route | None = None
+            ) -> AgentResult:
+                # Mimic the real shape: the trace ends with Node.CANCEL
+                # (the post-timeout sentinel) but the agent recorded the
+                # actual in-flight node as ANSWER on the result.
+                return AgentResult(
+                    query=query,
+                    final_query=query,
+                    answer="",
+                    citations=[],
+                    route=Route.LOOKUP,
+                    grade=0.0,
+                    attempts=1,
+                    trace=[
+                        TraceEvent(node=Node.RETRIEVE, started_at=0.0, elapsed_ms=1.0),
+                        TraceEvent(node=Node.GRADE, started_at=1.0, elapsed_ms=1.0),
+                        TraceEvent(node=Node.ANSWER, started_at=2.0, elapsed_ms=999.0),
+                        TraceEvent(node=Node.CANCEL, started_at=3.0, elapsed_ms=0.0),
+                    ],
+                    cancelled=CancelReason.TIMEOUT,
+                    cancelled_node=Node.ANSWER,
+                )
+
+            agent.run = _run  # type: ignore[method-assign]
+            return agent
+
+        monkeypatch.setattr(mcp_server, "_agent", fake_agent)
+        resp = await search_code("anything")
+        assert isinstance(resp, AgentTimeoutResponse)
+        # Phase reflects the in-flight node, NOT trace[-1] (cancel).
+        assert resp.phase == "answer"
+
+    async def test_real_timed_out_agent_run_phase_is_retrieve(self) -> None:
+        # End-to-end: stand up a real Agent with a slow retriever and a
+        # short step timeout, then push the AgentResult through
+        # ``_to_response`` and assert the phase reflects the actual
+        # node in flight when the deadline fired.
+        from codex_atlas.agent import Agent, AgentConfig, Node  # noqa: PLC0415
+
+        @dataclass
+        class _SlowRetriever:
+            async def retrieve(
+                self, query: str, *, route_override: Route | None = None
+            ) -> Any:
+                await asyncio.sleep(0.5)
+                # Never reached — the step timeout fires first.
+                raise AssertionError("expected timeout before retrieve returned")
+
+        agent = Agent(
+            _SlowRetriever(),  # type: ignore[arg-type]
+            config=AgentConfig(step_timeout_s=0.02),
+        )
+        result = await agent.run("q")
+        assert result.cancelled is CancelReason.TIMEOUT
+        assert result.cancelled_node is Node.RETRIEVE
+        # Push through the MCP boundary translator.
+        resp = mcp_server._to_response(result)
+        assert isinstance(resp, AgentTimeoutResponse)
+        assert resp.phase == "retrieve"
+
+
 class TestStartupValidation:
     """``validate_startup_config`` rejects unrunnable configs at startup.
 

@@ -200,6 +200,13 @@ class AgentResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     validation: ValidationReport | None = None
     cancelled: CancelReason | None = None
+    # The node that was executing when ``cancelled is TIMEOUT`` fired
+    # (e.g. ``Node.RETRIEVE``, ``Node.GRADE``, ``Node.ANSWER``). ``None``
+    # for runs that completed normally or were cancelled for any other
+    # reason. The MCP timeout response surfaces this directly so clients
+    # don't have to infer the phase from a trace that already includes
+    # the post-timeout ``Node.CANCEL`` event.
+    cancelled_node: Node | None = None
 
 
 @dataclass
@@ -216,6 +223,12 @@ class _State:
     cancelled: CancelReason | None = None
     # Set when the caller wants to skip classification for this run.
     route_override: Route | None = None
+    # The node currently executing — set when a node body starts and
+    # cleared when it finishes. The agent appends a ``Node.CANCEL``
+    # event after a timeout, so the MCP boundary cannot reliably infer
+    # the timed-out phase from ``trace[-1]``. ``in_flight_node`` is the
+    # source of truth for "what was running when the deadline fired".
+    in_flight_node: Node | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +611,15 @@ class Agent:
             )
             answer, citations, validation = ("", [], None)
 
+        # Surface the timed-out node only when the cancellation was
+        # actually a timeout — external cancels and normal completions
+        # leave ``cancelled_node`` as ``None`` so MCP clients only see
+        # the field populated when it carries useful diagnostic info.
+        cancelled_node = (
+            state.in_flight_node
+            if state.cancelled is CancelReason.TIMEOUT
+            else None
+        )
         return AgentResult(
             query=state.original_query,
             final_query=state.query,
@@ -610,6 +632,7 @@ class Agent:
             tool_calls=state.tool_calls,
             validation=validation,
             cancelled=state.cancelled,
+            cancelled_node=cancelled_node,
         )
 
     async def _with_run_deadline(self, coro: Coroutine[Any, Any, T], run_t0: float) -> T:
@@ -635,6 +658,7 @@ class Agent:
 
     async def _retrieve(self, state: _State) -> None:
         t0 = time.perf_counter()
+        state.in_flight_node = Node.RETRIEVE
         retrieval = await self._with_step_deadline(
             self._retriever.retrieve(state.query, route_override=state.route_override)
         )
@@ -683,6 +707,7 @@ class Agent:
             state.grade = 0.0
             return
         t0 = time.perf_counter()
+        state.in_flight_node = Node.GRADE
         # Empty retrieval -> grade 0 (forces a re-query). Non-empty
         # retrieval defaults to the router's classifier confidence — a
         # high-confidence classifier route with chunks present is the
@@ -709,6 +734,7 @@ class Agent:
         if state.retrieval is None:
             return
         t0 = time.perf_counter()
+        state.in_flight_node = Node.REWRITE
         new_query = await self._rewriter.rewrite(state.original_query, state.retrieval.chunks)
         elapsed = (time.perf_counter() - t0) * 1000.0
         state.trace.append(
@@ -725,6 +751,7 @@ class Agent:
     async def _answer(self, state: _State) -> tuple[str, list[Citation]]:
         chunks = state.retrieval.chunks if state.retrieval is not None else []
         t0 = time.perf_counter()
+        state.in_flight_node = Node.ANSWER
         answer = await self._with_step_deadline(self._synth.synthesize(state.query, chunks))
         elapsed = (time.perf_counter() - t0) * 1000.0
         state.trace.append(
@@ -753,6 +780,7 @@ class Agent:
     ) -> ValidationReport:
         chunks = state.retrieval.chunks if state.retrieval is not None else []
         t0 = time.perf_counter()
+        state.in_flight_node = Node.VALIDATE
         report = await self._with_step_deadline(
             self._validator.validate(state.query, answer, chunks)
         )

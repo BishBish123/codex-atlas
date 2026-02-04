@@ -283,6 +283,27 @@ class TestCancelOnTimeout:
         )
         result = await agent.run("q")
         assert result.cancelled is None
+        # ``cancelled_node`` is None when the run completed normally so
+        # MCP clients don't see stale phase data after a clean run.
+        assert result.cancelled_node is None
+
+    async def test_retrieve_timeout_records_cancelled_node(self) -> None:
+        # A real timed-out retrieve must surface
+        # ``cancelled_node == Node.RETRIEVE``. Earlier the MCP boundary
+        # inferred phase from ``trace[-1]`` — but the agent appends
+        # ``Node.CANCEL`` AFTER timeout, so that always reported
+        # ``cancel`` and hid the real phase.
+        retriever = SlowRetriever(delay_s=0.5)
+        agent = Agent(
+            retriever,  # type: ignore[arg-type]
+            config=AgentConfig(step_timeout_s=0.05),
+        )
+        result = await agent.run("q")
+        assert result.cancelled is CancelReason.TIMEOUT
+        assert result.cancelled_node is Node.RETRIEVE
+        # Sanity: the trace's last entry IS Node.CANCEL — the bug being
+        # avoided is reading the phase from there.
+        assert result.trace[-1].node is Node.CANCEL
 
 
 @dataclass

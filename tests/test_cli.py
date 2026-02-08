@@ -405,6 +405,15 @@ class TestEvalGraphPreflight:
         self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
     ) -> None:
         monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        # Provide a valid (non-empty) corpus so the corpus preflight
+        # passes — we want to reach the missing-graph error path. The
+        # corpus preflight runs BEFORE the graph check now (so a bad
+        # ``--corpus`` short-circuits before the encoder model loads),
+        # which means an empty-dir ``--corpus`` would surface a corpus
+        # error first instead of the graph error this test exercises.
+        corpus = tmp_path / "src"
+        corpus.mkdir()
+        (corpus / "a.py").write_text("def foo():\n    return 1\n")
         result = runner.invoke(
             app,
             [
@@ -414,7 +423,7 @@ class TestEvalGraphPreflight:
                 "--store",
                 "memory",
                 "--corpus",
-                str(tmp_path),  # empty dir is fine — we never reach indexing
+                str(corpus),
                 "--out",
                 str(tmp_path / "REPORT.md"),
             ],
@@ -518,6 +527,53 @@ class TestEvalGraphPreflight:
         assert result.exit_code != 0, result.stdout
         flat = " ".join(result.stdout.split())
         assert "must be a directory" in flat or "missing path" in flat
+
+    def test_eval_bad_corpus_short_circuits_before_encoder_load(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # Regression: ``_resolve_encoder`` for any non-`fake` value loads
+        # a sentence-transformers model (slow, may hit the network on a
+        # cold cache). A typo'd ``--corpus`` should surface a path
+        # error *before* paying that cost. Patch ``_resolve_encoder`` to
+        # raise unconditionally — if the corpus check fires first
+        # (correct behavior), the user sees the corpus error and the
+        # encoder shim is never invoked. If it fires second (bug), the
+        # encoder shim raises a generic RuntimeError mapped to exit 1.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        from codex_atlas import cli as cli_mod  # noqa: PLC0415
+
+        encoder_called = {"n": 0}
+
+        def boom(_name: str):  # type: ignore[no-untyped-def]
+            encoder_called["n"] += 1
+            raise RuntimeError("encoder load attempted before corpus validation")
+
+        monkeypatch.setattr(cli_mod, "_resolve_encoder", boom)
+        result = runner.invoke(
+            app,
+            [
+                "eval",
+                "--graph",
+                str(tmp_path / "graph.json"),
+                "--store",
+                "memory",
+                "--corpus",
+                str(tmp_path / "missing-corpus"),
+                "--encoder",
+                "BAAI/bge-small-en-v1.5",  # would-be heavy load
+                "--out",
+                str(tmp_path / "REPORT.md"),
+            ],
+        )
+        assert result.exit_code == 2, result.stdout
+        flat = " ".join(result.stdout.split())
+        assert "must be a directory" in flat or "missing path" in flat
+        # The encoder shim must NOT have been invoked.
+        assert encoder_called["n"] == 0, (
+            f"_resolve_encoder ran before corpus validation "
+            f"(called {encoder_called['n']}x); the heavy encoder model "
+            "would have downloaded for what is just a CLI typo."
+        )
 
     def test_eval_rebuild_graph_builds_inline(
         self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]

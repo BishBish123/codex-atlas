@@ -607,6 +607,16 @@ def eval_cmd(  # noqa: PLR0915
     ),
 ) -> None:
     """Run the golden test set and write a markdown + (optional) JSON report."""
+    # Validate `--corpus` BEFORE we resolve the encoder. For any
+    # non-`fake` encoder, ``_resolve_encoder`` loads a
+    # sentence-transformers model (slow, may hit the network on a cold
+    # cache); a typo'd `--corpus` shouldn't pay that cost just to bail
+    # with a path error a few seconds later. The validation is pure
+    # sync; the parsed result is captured in a single-element holder
+    # so the inner ``_run`` coroutine can read it via closure without
+    # re-parsing (eval-time corpora can be 1000s of files).
+    needs_corpus = rebuild_graph or store_backend == "memory"
+    parsed_corpus_holder: list[list] = []  # type: ignore[type-arg]
 
     async def _run() -> None:  # noqa: PLR0912, PLR0915
         encoder_obj = _resolve_encoder(encoder)
@@ -617,7 +627,7 @@ def eval_cmd(  # noqa: PLR0915
         # --corpus src` instead of having to remember the two-step
         # `atlas index --skip-embed` invocation.
         if rebuild_graph:
-            parsed = _require_corpus_dir_and_parse(corpus)
+            parsed = parsed_corpus_holder[0]  # validated above
             cg_built = CallGraph()
             cg_built.ingest(parsed)
             cg_built.save(graph)
@@ -638,7 +648,7 @@ def eval_cmd(  # noqa: PLR0915
             # the harness stays hermetic. No DSN, no pgvector.
             store = InMemoryChunkStore()
             await store.setup(dim=encoder_obj.dim)
-            parsed = _require_corpus_dir_and_parse(corpus)
+            parsed = parsed_corpus_holder[0]  # validated above
             chunks = [c for pf in parsed for c in pf.chunks]
             if chunks:
                 vectors = encoder_obj.encode([c.text for c in chunks])
@@ -720,4 +730,11 @@ def eval_cmd(  # noqa: PLR0915
         console.print(report.split("## By category")[0])
 
     with _command_wrapper():
+        # Hoist corpus validation ABOVE ``_resolve_encoder`` so a bad
+        # ``--corpus`` short-circuits before the encoder model loads.
+        # The two branches that need the parse (``rebuild-graph`` and
+        # ``--store=memory``) read it from ``parsed_corpus_holder``
+        # inside ``_run`` via closure.
+        if needs_corpus:
+            parsed_corpus_holder.append(_require_corpus_dir_and_parse(corpus))
         asyncio.run(_run())

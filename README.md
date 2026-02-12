@@ -222,7 +222,7 @@ docs/ARCHITECTURE.md  Deep dive into indexer / graph / retriever / agent
 docs/ADR-001..004     pgvector-vs-faiss / graph-walk-first / state-machine / mcp-shape
 ```
 
-## Honest limitations (what to read in eval/REPORT.md)
+## Honest limitations (what to read in evals/REPORT.md)
 
 The "what I did NOT measure" section is in the eval report. The headline:
 

@@ -212,7 +212,7 @@ src/codex_atlas/
   retriever.py    Heuristic classifier + 6-route retriever
   agent.py        State machine: classify → retrieve → grade → rewrite → answer
   mcp_server.py   FastMCP wrapping 7 tools + 1 resource
-  cli.py          `atlas index | ask | eval`
+  cli.py          `atlas index | ask | search | explain | mcp | eval`
   eval/           Golden set + harness + render_report
 
 tests/            unit tests (no DB) + integration markers

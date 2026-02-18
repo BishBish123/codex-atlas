@@ -546,6 +546,64 @@ class TestMcpAgentTimeoutPhaseFromCancelledNode:
         assert resp.phase == "retrieve"
 
 
+class TestMcpAnswerTruncationCap:
+    """`_to_response` must keep the FINAL answer (with truncation marker)
+    at or below ``MAX_MCP_ANSWER_BYTES``.
+
+    Earlier the truncation logic clipped to the cap and THEN appended
+    the marker, so the annotated answer always exceeded the advertised
+    byte cap by ``len(marker)``.
+    """
+
+    async def test_truncated_answer_with_marker_stays_under_cap(self) -> None:
+        from codex_atlas.agent import Node  # noqa: PLC0415
+
+        # Build an oversized answer (well past the cap).
+        oversize = "x" * (mcp_server.MAX_MCP_ANSWER_BYTES + 5_000)
+        result = AgentResult(
+            query="q",
+            final_query="q",
+            answer=oversize,
+            citations=[],
+            route=Route.LOOKUP,
+            grade=1.0,
+            attempts=1,
+            trace=[TraceEvent(node=Node.ANSWER, started_at=0.0, elapsed_ms=1.0)],
+        )
+        resp = mcp_server._to_response(result)
+        # Successful path produces SearchResponse, not AgentTimeoutResponse.
+        from codex_atlas.mcp_server import SearchResponse  # noqa: PLC0415
+
+        assert isinstance(resp, SearchResponse)
+        # The marker is present so callers know the answer was clipped.
+        assert "[answer truncated at MAX_MCP_ANSWER_BYTES]" in resp.answer
+        # The FINAL annotated string (answer + marker) must respect the cap.
+        final_bytes = len(resp.answer.encode("utf-8"))
+        assert final_bytes <= mcp_server.MAX_MCP_ANSWER_BYTES, (
+            f"final answer is {final_bytes} bytes, "
+            f"exceeds cap {mcp_server.MAX_MCP_ANSWER_BYTES}"
+        )
+
+    async def test_short_answer_left_unchanged(self) -> None:
+        from codex_atlas.agent import Node  # noqa: PLC0415
+
+        result = AgentResult(
+            query="q",
+            final_query="q",
+            answer="hi",
+            citations=[],
+            route=Route.LOOKUP,
+            grade=1.0,
+            attempts=1,
+            trace=[TraceEvent(node=Node.ANSWER, started_at=0.0, elapsed_ms=1.0)],
+        )
+        resp = mcp_server._to_response(result)
+        from codex_atlas.mcp_server import SearchResponse  # noqa: PLC0415
+
+        assert isinstance(resp, SearchResponse)
+        assert resp.answer == "hi"
+
+
 class TestStartupValidation:
     """``validate_startup_config`` rejects unrunnable configs at startup.
 

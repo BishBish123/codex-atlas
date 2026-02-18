@@ -289,12 +289,38 @@ def _to_response(result: AgentResult) -> SearchResponse | AgentTimeoutResponse:
     # flood the MCP client's context window.
     answer = result.answer
     if len(answer.encode("utf-8")) > MAX_MCP_ANSWER_BYTES:
-        # Truncate to the last valid UTF-8 boundary within the byte cap
-        # and append a truncation marker.
-        truncated = answer.encode("utf-8")[:MAX_MCP_ANSWER_BYTES].decode(
-            "utf-8", errors="ignore"
-        )
-        answer = truncated + "\n\n[answer truncated at MAX_MCP_ANSWER_BYTES]"
+        # Reserve the marker bytes BEFORE slicing the original answer
+        # so the FINAL annotated string stays at or below
+        # ``MAX_MCP_ANSWER_BYTES``. Earlier we sliced to the cap and
+        # then appended the marker, so the annotated answer always
+        # exceeded the advertised cap by ``len(marker)`` bytes — a
+        # silent overrun for any client relying on the byte budget.
+        marker = "\n\n[answer truncated at MAX_MCP_ANSWER_BYTES]"
+        marker_bytes = len(marker.encode("utf-8"))
+        budget = MAX_MCP_ANSWER_BYTES - marker_bytes
+        if budget < 0:
+            # Marker alone exceeds the cap (would only happen if the
+            # cap were configured below the marker length). Drop the
+            # marker — preserving the cap is more important than the
+            # truncation hint, and downstream readers can still see
+            # the answer was clipped via the byte length.
+            answer = answer.encode("utf-8")[:MAX_MCP_ANSWER_BYTES].decode(
+                "utf-8", errors="ignore"
+            )
+        else:
+            truncated = answer.encode("utf-8")[:budget].decode(
+                "utf-8", errors="ignore"
+            )
+            answer = truncated + marker
+        # Belt-and-braces: ``errors="ignore"`` may have produced a
+        # shorter byte string than ``budget`` if the slice landed mid-
+        # codepoint, but the marker re-add could in theory push past
+        # the cap if a future change widens the marker. Re-clamp.
+        encoded = answer.encode("utf-8")
+        if len(encoded) > MAX_MCP_ANSWER_BYTES:
+            answer = encoded[:MAX_MCP_ANSWER_BYTES].decode(
+                "utf-8", errors="ignore"
+            )
     citations = result.citations[:MAX_MCP_CITATIONS]
     hits = [
         CodeSearchHit(

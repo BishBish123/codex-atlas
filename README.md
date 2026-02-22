@@ -193,7 +193,7 @@ The eval report includes a hand-written **7-failure-mode taxonomy** with mitigat
 
 | Layer | Choice | Why |
 | --- | --- | --- |
-| MCP SDK | FastMCP 2.x | Auto-schema from Pydantic; standard SDK |
+| MCP SDK | FastMCP (`>=2.0`, resolves to 3.x today) | Auto-schema from Pydantic; standard SDK |
 | Type contracts | Pydantic v2 | What FastMCP introspects for tool schemas |
 | Vector DB | pgvector on Postgres 17 | SQL-native; recruiters trust Postgres; HNSW built-in |
 | Graph store | NetworkX (in-memory) | A 50K-node single-codebase graph fits easily; sidesteps Neo4j signup |

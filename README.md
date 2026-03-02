@@ -77,7 +77,9 @@ The whole thing is wrapped as a FastMCP server with 7 tools + 1 resource:
 git clone https://github.com/BishBish123/codex-atlas.git
 cd codex-atlas
 make install          # uv sync (+ embed extra on supported platforms)
-# Intel macOS: use `make install-min` (sentence-transformers wheels are arm64-only).
+# Intel macOS: `make install` and `make install-min` are equivalent — `pyproject.toml`
+# already gates `torch` / `sentence-transformers` behind `platform_machine == 'arm64'`,
+# so the heavy ML extras are skipped automatically.
 
 # No Docker, no DB — index into a JSON snapshot at data/chunks.json.
 uv run atlas index src/ --store=memory

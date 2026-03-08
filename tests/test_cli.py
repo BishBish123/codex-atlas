@@ -304,6 +304,84 @@ class TestMemoryStore:
         assert "atlas index" in result.stdout
 
 
+class TestMissingGraphFriendlyError:
+    """`atlas ask`, `atlas search`, and `atlas explain` used to surface
+    a generic ``internal error [Errno 2] No such file or directory:
+    'data/graph.json'`` when run before ``atlas index``. ``atlas eval``
+    already had a friendly preflight; this mirrors it for the three
+    query commands so a first-time user gets an actionable next step."""
+
+    def test_ask_missing_graph_friendly_error(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        result = runner.invoke(
+            app,
+            [
+                "ask",
+                "anything",
+                "--graph",
+                str(tmp_path / "absent.json"),
+                "--store",
+                "memory",
+                "--chunks",
+                str(tmp_path / "missing.json"),
+            ],
+        )
+        assert result.exit_code == 2, result.stdout
+        flat = " ".join(result.stdout.split())
+        assert "graph file missing" in flat
+        assert "atlas index" in flat
+        # NOT the old generic exit-1 surface.
+        assert "internal error" not in flat
+
+    def test_search_missing_graph_friendly_error(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        result = runner.invoke(
+            app,
+            [
+                "search",
+                "foo",
+                "--graph",
+                str(tmp_path / "absent.json"),
+                "--store",
+                "memory",
+                "--chunks",
+                str(tmp_path / "missing.json"),
+            ],
+        )
+        assert result.exit_code == 2, result.stdout
+        flat = " ".join(result.stdout.split())
+        assert "graph file missing" in flat
+        assert "atlas index" in flat
+        assert "internal error" not in flat
+
+    def test_explain_missing_graph_friendly_error(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        result = runner.invoke(
+            app,
+            [
+                "explain",
+                "pkg.mod.fn",
+                "--graph",
+                str(tmp_path / "absent.json"),
+                "--store",
+                "memory",
+                "--chunks",
+                str(tmp_path / "missing.json"),
+            ],
+        )
+        assert result.exit_code == 2, result.stdout
+        flat = " ".join(result.stdout.split())
+        assert "graph file missing" in flat
+        assert "atlas index" in flat
+        assert "internal error" not in flat
+
+
 class TestExplainForcesStructuralRoute:
     """`atlas explain` must force ``route_override=Route.STRUCTURAL`` so the
     classifier can't downgrade a structural intent to vector-only lookup.

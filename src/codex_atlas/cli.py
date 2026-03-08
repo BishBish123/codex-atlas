@@ -127,6 +127,24 @@ def _dsn() -> str:
 DEFAULT_MEMORY_STORE_PATH = Path("data/chunks.json")
 
 
+def _require_graph_exists(graph: Path) -> None:
+    """Bail with an actionable message when ``graph.json`` is missing.
+
+    ``ask``/``search``/``explain`` all call ``CallGraph.load(graph)``
+    immediately, which surfaces ``FileNotFoundError`` as the generic
+    ``internal error`` exit-1 path of ``_command_wrapper``. Mirror the
+    friendly preflight ``eval_cmd`` does so a first-time user who
+    skipped ``atlas index`` sees a clear next step instead of an
+    opaque errno-2 stack trace.
+    """
+    if not graph.exists():
+        _bail(
+            f"graph file missing at {graph} — run "
+            f"`atlas index <path-to-source>` first to build it. "
+            f"For a no-DB hermetic setup pass `--store=memory`."
+        )
+
+
 async def _open_query_store(
     *, store_backend: str, dim: int, memory_path: Path
 ) -> ChunkStoreProtocol:
@@ -322,6 +340,7 @@ def ask(
     """Run a single agent query end-to-end."""
 
     async def _run() -> None:
+        _require_graph_exists(graph)
         encoder_obj = _resolve_encoder(encoder)
         cg = CallGraph.load(graph)
         store = await _open_query_store(
@@ -375,6 +394,7 @@ def search(
     """One-shot retrieval — runs the router but skips the answer synthesis."""
 
     async def _run() -> None:
+        _require_graph_exists(graph)
         encoder_obj = _resolve_encoder(encoder)
         cg = CallGraph.load(graph)
         store = await _open_query_store(
@@ -467,6 +487,7 @@ def explain(
     """
 
     async def _run() -> None:
+        _require_graph_exists(graph)
         encoder_obj = _resolve_encoder(encoder)
         cg = CallGraph.load(graph)
         store = await _open_query_store(

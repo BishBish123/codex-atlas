@@ -119,16 +119,19 @@ retrieval/synthesis step) and `ATLAS_RUN_TIMEOUT_S=30` (whole run); set either t
 disable.  On timeout, tools return `{"error": "agent_timeout", "phase": "<last_node>"}`.
 
 ```bash
-# stdio for Claude Desktop / Claude Code (memory store, no DSN needed)
-ATLAS_STORE=memory ATLAS_GRAPH_PATH=data/graph.json \
+# stdio for Claude Desktop / Claude Code (memory store, no DSN needed).
+# Use absolute paths so MCP clients with unpredictable cwds resolve them
+# correctly — `$(pwd)/...` expands at shell-eval time so the snippet stays
+# copy-pastable from inside the cloned repo.
+ATLAS_STORE=memory ATLAS_GRAPH_PATH=$(pwd)/data/graph.json \
     uv run atlas-mcp
 
 # HTTP for the MCP Inspector / remote clients
-ATLAS_STORE=memory ATLAS_GRAPH_PATH=data/graph.json \
+ATLAS_STORE=memory ATLAS_GRAPH_PATH=$(pwd)/data/graph.json \
     uv run atlas-mcp --transport http --port 8090
 
 # Postgres backend (only when ATLAS_STORE=postgres)
-POSTGRES_DSN=$POSTGRES_DSN ATLAS_STORE=postgres ATLAS_GRAPH_PATH=data/graph.json \
+POSTGRES_DSN=$POSTGRES_DSN ATLAS_STORE=postgres ATLAS_GRAPH_PATH=$(pwd)/data/graph.json \
     uv run atlas-mcp
 ```
 

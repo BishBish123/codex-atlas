@@ -518,10 +518,29 @@ def validate_startup_config() -> None:
 # ---------------------------------------------------------------------------
 
 
+# The ``atlas-mcp`` entry point intentionally has fewer flags than the
+# ``atlas mcp`` subcommand — the MCP server reads its store / chunks /
+# graph configuration from environment variables so wrappers like
+# Claude Desktop's ``mcpServers`` block (which only sets ``env``,
+# never ``args``) work without a flag-passing shim. Document the env
+# contract in the help epilog so ``atlas-mcp --help`` doesn't read as
+# a feature gap relative to ``atlas mcp --help``.
+_ATLAS_MCP_EPILOG = (
+    "Environment variables (read at first-tool-call time):\n"
+    "  ATLAS_STORE         memory (default; reads ATLAS_CHUNKS_PATH) | postgres\n"
+    "  ATLAS_GRAPH_PATH    persisted call graph; default data/graph.json\n"
+    "  ATLAS_CHUNKS_PATH   chunk snapshot when ATLAS_STORE=memory; default data/chunks.json\n"
+    "  ATLAS_ENCODER       fake (default; deterministic blake2b) | sentence-transformers model id\n"
+    "  ATLAS_STEP_TIMEOUT_S per-step (retriever/synth) timeout; default 10, 0 disables\n"
+    "  ATLAS_RUN_TIMEOUT_S  whole-run timeout; default 30, 0 disables\n"
+    "  POSTGRES_DSN        required when ATLAS_STORE=postgres\n"
+    "Use absolute paths under MCP — clients launch the server with an unpredictable cwd."
+)
+
 _cli = typer.Typer(name="atlas-mcp", add_completion=False)
 
 
-@_cli.command()
+@_cli.command(epilog=_ATLAS_MCP_EPILOG)
 def run(
     transport: str = typer.Option("stdio", help="MCP transport: stdio | http"),
     host: str = typer.Option("127.0.0.1", help="HTTP bind host."),

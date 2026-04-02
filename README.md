@@ -98,6 +98,9 @@ uv run atlas index /Users/me/my-project --store=memory
 # Run the golden test set.
 uv run atlas eval --json-out evals/scores.json
 cat evals/REPORT.md
+
+# Run the unit tests.
+uv run pytest -q                          # or: make test
 ```
 
 Want pgvector instead? Boot Postgres + pgvector and switch the flag:

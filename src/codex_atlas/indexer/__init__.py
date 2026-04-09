@@ -1,4 +1,4 @@
-"""Codex-Atlas indexer: AST parser + chunker + walker + call graph."""
+"""Codex-Atlas indexer: AST parser + chunker + pgvector + NetworkX call graph."""
 
 from codex_atlas.indexer.ast_parser import (
     Chunk,

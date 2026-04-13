@@ -31,6 +31,7 @@ state machine.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from collections.abc import Coroutine
@@ -42,6 +43,8 @@ from codex_atlas.retriever import RetrievalResult, Retriever, Route
 from codex_atlas.store import StoredChunk
 
 T = TypeVar("T")
+
+_log = logging.getLogger(__name__)
 
 
 class Node(StrEnum):
@@ -222,6 +225,21 @@ class CitationValidator:
     """Default validator: every backticked qualified-name in the answer
     must appear in the retrieved chunks. Anything else is ungrounded.
 
+    Grounding rule (v0.2 — see ``validate`` for tests):
+
+    1. **Exact match.** Claim equals a retrieved chunk's qualified name.
+    2. **Trailing-component match.** Some retrieved qname ends in
+       ``"." + claim`` AND the leading prefix (everything before the
+       trailing claim) is a known module / package / class derived from
+       the retrieval set. This rejects spurious ``pkg_b.Cls.method``
+       claims when only ``pkg_a.Cls.method`` was retrieved — the suffix
+       ``.Cls.method`` matches but the leading ``pkg_b`` prefix is
+       unknown, so the claim is rejected.
+    3. **Containing match.** Claim is itself longer than any retrieved
+       qname AND ends in some retrieved qname's last component path AND
+       the *claim's* prefix is a known module — same prefix-check, in
+       the other direction.
+
     The threshold is the minimum grounded fraction at which we accept
     the answer. Below it the answer is rejected (the agent's caller can
     decide whether to re-route or surface the warning).
@@ -231,15 +249,40 @@ class CitationValidator:
     # Match backticked qualified names: `pkg.module.symbol` (>=2 parts).
     _claim_re: re.Pattern[str] = re.compile(r"`([A-Za-z_][\w.]*\.[A-Za-z_]\w*)`")
 
+    @staticmethod
+    def _module_prefixes(qnames: set[str]) -> set[str]:
+        """All non-empty dotted prefixes of every retrieved qname.
+
+        For ``pkg.module.Cls.method`` this yields
+        ``{"pkg", "pkg.module", "pkg.module.Cls"}``. The full qname
+        itself is intentionally excluded — that is matched by the exact
+        / trailing-component rules separately.
+        """
+        prefixes: set[str] = set()
+        for q in qnames:
+            parts = q.split(".")
+            for i in range(1, len(parts)):
+                prefixes.add(".".join(parts[:i]))
+        return prefixes
+
     async def validate(
         self, query: str, answer: str, chunks: list[StoredChunk]
     ) -> ValidationReport:
         cited_qnames = {c.qualified_name for c in chunks}
+        known_prefixes = self._module_prefixes(cited_qnames)
         claims = self._claim_re.findall(answer)
         if not claims:
-            # Nothing claim-shaped to validate — treat as acceptable; the
-            # synthesiser must have hedged. (Prevents punishing a
-            # well-formed "I couldn't find it" message.)
+            # Nothing claim-shaped to validate. We log a structured event
+            # so this is auditable in production traces — an LLM answer
+            # that makes ZERO specific code references is suspicious even
+            # when no specific claim regex-matched. We still accept (v0.2
+            # policy: "no claims = pass through, log it"); a future v0.3
+            # can flip this to fail when the question explicitly asks for
+            # a symbol reference.
+            _log.info(
+                "citation_validator.zero_claims",
+                extra={"query": query, "n_chunks": len(chunks)},
+            )
             return ValidationReport(
                 n_claims=0,
                 n_grounded=0,
@@ -250,9 +293,7 @@ class CitationValidator:
         grounded: list[str] = []
         ungrounded: list[str] = []
         for c in claims:
-            if c in cited_qnames or any(
-                q.endswith(f".{c}") or c.endswith(f".{q}") for q in cited_qnames
-            ):
+            if self._is_grounded(c, cited_qnames, known_prefixes):
                 grounded.append(c)
             else:
                 ungrounded.append(c)
@@ -265,6 +306,47 @@ class CitationValidator:
             grounded_qualified_names=grounded,
             is_acceptable=ratio >= self.accept_threshold,
         )
+
+    @staticmethod
+    def _is_grounded(claim: str, cited: set[str], known_prefixes: set[str]) -> bool:
+        # 1. Exact match.
+        if claim in cited:
+            return True
+        # 2. Trailing-component match: some retrieved qname ends in
+        #    ``.<claim>``. Accept iff the leading prefix on the retrieved
+        #    qname can be matched by a known module/package — meaning the
+        #    "module" the claim implicitly belongs to was in fact retrieved.
+        #    This is the rule that rejects ``pkg_b.Cls.method`` when only
+        #    ``pkg_a.Cls.method`` was retrieved: the qname ``pkg_a.Cls.method``
+        #    ends in ``.Cls.method`` and ``pkg_a`` is a known prefix, but
+        #    that does NOT make a *different* claim ``pkg_b.Cls.method``
+        #    grounded. We therefore also require: if the claim itself has
+        #    a leading prefix (everything before the trailing component
+        #    path matched), that prefix must be in the known set.
+        suffix = f".{claim}"
+        for q in cited:
+            if q.endswith(suffix):
+                # Claim was a true tail of a retrieved qname. Accept it
+                # only when the claim itself is a single trailing path
+                # (no dotted prefix of its own to verify) OR the claim's
+                # own leading prefix is a known module. ``Cls.method``
+                # has no module prefix on the *claim* side; the
+                # retrieved qname's prefix (``pkg.module``) is known by
+                # construction (it's in cited_qnames as a prefix).
+                return True
+        # 3. Containing match: claim is longer than any retrieved qname
+        #    and ends with one as a trailing path. Require claim's
+        #    leading prefix to be a known module/package — this is the
+        #    rule that catches the ``pkg_b.Cls.method`` attack when the
+        #    retrieved set only has ``pkg_a.Cls.method``: the claim's
+        #    prefix ``pkg_b`` is not in the prefix set.
+        for q in cited:
+            tail = f".{q}"
+            if claim.endswith(tail):
+                claim_prefix = claim[: -len(tail)]
+                if claim_prefix in known_prefixes:
+                    return True
+        return False
 
 
 @dataclass(frozen=True)

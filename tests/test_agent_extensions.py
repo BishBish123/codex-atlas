@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 
 from codex_atlas.agent import (
@@ -115,6 +116,53 @@ class TestCitationValidator:
         answer = "see `Cls.method`"
         report = await validator.validate("q", answer, chunks)
         assert report.is_acceptable
+
+    async def test_validator_rejects_wrong_module_suffix_match(self) -> None:
+        # Retrieved chunk is in pkg_a; the answer claims pkg_b. Rejecting
+        # this is the whole point of v0.2 grounding: the trailing path
+        # ``Cls.method`` is the same, but the leading module prefix of the
+        # claim (``pkg_b``) is not in the retrieval set's known prefixes
+        # (``{pkg_a, pkg_a.Cls}``), so the claim is ungrounded.
+        validator = CitationValidator()
+        chunks = [_stored("pkg_a.Cls.method")]
+        answer = "see `pkg_b.Cls.method` for the implementation"
+        report = await validator.validate("q", answer, chunks)
+        assert "pkg_b.Cls.method" in report.ungrounded_claims
+        assert not report.is_acceptable
+
+    async def test_validator_accepts_exact_qualified_match(self) -> None:
+        # Retrieved + claim are byte-identical: the rule-1 exact match.
+        validator = CitationValidator()
+        chunks = [_stored("pkg_a.Cls.method")]
+        answer = "see `pkg_a.Cls.method`"
+        report = await validator.validate("q", answer, chunks)
+        assert report.is_acceptable
+        assert "pkg_a.Cls.method" in report.grounded_qualified_names
+
+    async def test_validator_handles_short_unqualified_reference(self) -> None:
+        # A claim shaped like ``Cls.method`` (no module) is accepted when
+        # any retrieved qname ends in it. This is the suffix-only rule —
+        # documented as a pass-through: the claim is too short to verify
+        # the implied module, but rejecting it would punish well-formed
+        # answers that use class-level shorthand.
+        validator = CitationValidator()
+        chunks = [_stored("pkg_a.Cls.method")]
+        answer = "use `Cls.method` here"
+        report = await validator.validate("q", answer, chunks)
+        # Deterministic: pass-through.
+        assert report.is_acceptable
+        assert "Cls.method" in report.grounded_qualified_names
+
+    async def test_zero_claims_logs_structured_event(self, caplog) -> None:  # type: ignore[no-untyped-def]
+        # v0.2 policy: zero specific claims still passes, but we log it
+        # so production traces can audit how often it happens.
+        validator = CitationValidator()
+        with caplog.at_level(logging.INFO, logger="codex_atlas.agent"):
+            report = await validator.validate("q", "no specifics here", [])
+        assert report.n_claims == 0
+        assert report.is_acceptable
+        # A structured info-log was emitted under the agent logger.
+        assert any("zero_claims" in rec.message for rec in caplog.records)
 
 
 class TestAgentValidationIntegration:

@@ -534,6 +534,35 @@ def mcp(
             raise typer.BadParameter(f"unknown transport {transport!r}")
 
 
+def _require_corpus_dir_and_parse(corpus: Path) -> list:  # type: ignore[type-arg]
+    """Validate ``corpus`` is a non-empty directory and return its parse.
+
+    Mirrors the same guards ``index()`` runs before any state write:
+    a missing path or single ``.py`` file would otherwise produce an
+    empty parse, which silently evaluates against zero chunks rather
+    than failing — turning every retrieval into an unanswerable query.
+    Both eval-time entry points (``--rebuild-graph`` and
+    ``--store=memory``) must validate before parsing. ``_bail`` is used
+    over ``typer.BadParameter`` because the call sites live inside
+    ``asyncio.run(_run())`` and BadParameter raised through the asyncio
+    boundary doesn't reach typer's pretty-printer — the user would see
+    an empty stderr and a bare ``SystemExit(2)``.
+    """
+    if not corpus.is_dir():
+        what = "missing path" if not corpus.exists() else "file"
+        _bail(
+            f"--corpus must be a directory; got {what}: {corpus}. "
+            "To evaluate against a single file, pass a directory containing only that file."
+        )
+    parsed = parse_corpus(corpus)
+    if not parsed:
+        _bail(
+            f"0 .py files found under {corpus}; aborting eval — "
+            f"the harness would otherwise score every question against an empty index."
+        )
+    return parsed
+
+
 @app.command(name="eval")
 def eval_cmd(  # noqa: PLR0915
     graph: Path = typer.Option(Path("data/graph.json"), help="Persisted call graph."),
@@ -588,7 +617,7 @@ def eval_cmd(  # noqa: PLR0915
         # --corpus src` instead of having to remember the two-step
         # `atlas index --skip-embed` invocation.
         if rebuild_graph:
-            parsed = parse_corpus(corpus)
+            parsed = _require_corpus_dir_and_parse(corpus)
             cg_built = CallGraph()
             cg_built.ingest(parsed)
             cg_built.save(graph)
@@ -609,7 +638,7 @@ def eval_cmd(  # noqa: PLR0915
             # the harness stays hermetic. No DSN, no pgvector.
             store = InMemoryChunkStore()
             await store.setup(dim=encoder_obj.dim)
-            parsed = parse_corpus(corpus)
+            parsed = _require_corpus_dir_and_parse(corpus)
             chunks = [c for pf in parsed for c in pf.chunks]
             if chunks:
                 vectors = encoder_obj.encode([c.text for c in chunks])

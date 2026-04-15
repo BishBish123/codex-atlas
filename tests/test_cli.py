@@ -427,6 +427,98 @@ class TestEvalGraphPreflight:
         assert "atlas index --skip-embed" in flat
         assert "--rebuild-graph" in flat
 
+    def test_eval_rebuild_graph_rejects_missing_corpus(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # `--rebuild-graph` used to call `parse_corpus()` directly with no
+        # validation, so a missing path silently produced an empty parse
+        # and the harness scored every question against zero chunks.
+        # The eval-time guard now mirrors `index()`'s checks.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        result = runner.invoke(
+            app,
+            [
+                "eval",
+                "--graph",
+                str(tmp_path / "graph.json"),
+                "--store",
+                "memory",
+                "--corpus",
+                str(tmp_path / "does-not-exist"),
+                "--rebuild-graph",
+                "--out",
+                str(tmp_path / "REPORT.md"),
+            ],
+        )
+        assert result.exit_code != 0, result.stdout
+        flat = " ".join(result.stdout.split())
+        assert "must be a directory" in flat or "missing path" in flat
+
+    def test_eval_rebuild_graph_rejects_single_file_corpus(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # A single .py file passed as --corpus would slip past
+        # `is_dir()` and produce an empty walk. Reject explicitly.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        single = tmp_path / "lone.py"
+        single.write_text("def f(): pass\n")
+        result = runner.invoke(
+            app,
+            [
+                "eval",
+                "--graph",
+                str(tmp_path / "graph.json"),
+                "--store",
+                "memory",
+                "--corpus",
+                str(single),
+                "--rebuild-graph",
+                "--out",
+                str(tmp_path / "REPORT.md"),
+            ],
+        )
+        assert result.exit_code != 0, result.stdout
+        flat = " ".join(result.stdout.split())
+        assert "must be a directory" in flat
+
+    def test_eval_memory_store_rejects_missing_corpus(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # The non-rebuild memory branch ALSO calls parse_corpus and used
+        # to silently evaluate against an empty index. Build a graph
+        # first so we get past the graph-existence preflight, then point
+        # --corpus at a missing path.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        corpus = tmp_path / "src"
+        corpus.mkdir()
+        (corpus / "a.py").write_text("def foo(): pass\n")
+        graph_path = tmp_path / "graph.json"
+        # Pre-build the graph so the eval reaches the memory-store path.
+        from codex_atlas.indexer.graph import CallGraph  # noqa: PLC0415
+        from codex_atlas.indexer.walker import parse_corpus  # noqa: PLC0415
+
+        cg = CallGraph()
+        cg.ingest(parse_corpus(corpus))
+        cg.save(graph_path)
+        # Now run eval with a non-existent --corpus.
+        result = runner.invoke(
+            app,
+            [
+                "eval",
+                "--graph",
+                str(graph_path),
+                "--store",
+                "memory",
+                "--corpus",
+                str(tmp_path / "does-not-exist"),
+                "--out",
+                str(tmp_path / "REPORT.md"),
+            ],
+        )
+        assert result.exit_code != 0, result.stdout
+        flat = " ".join(result.stdout.split())
+        assert "must be a directory" in flat or "missing path" in flat
+
     def test_eval_rebuild_graph_builds_inline(
         self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
     ) -> None:

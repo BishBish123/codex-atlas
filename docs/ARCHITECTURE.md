@@ -63,8 +63,9 @@ pgvector on Postgres 17 via `asyncpg`. One row per indexed chunk
 (`id`, `qualified_name`, `file_path`, `lineno_start`, `lineno_end`,
 `kind`, `text`, `vec`). HNSW index on `vec` with `vector_cosine_ops`,
 parameters tuned for the 10K–50K chunk range a single-codebase ingest
-hits. `upsert_chunks` is idempotent on `(file_path, qualified_name,
-lineno_start)`.
+hits. `upsert_chunks` is idempotent on stable `(file_path,
+qualified_name)` IDs plus per-file tombstoning, so re-indexing the
+same file replaces stale chunks even when their line ranges shift.
 
 The encoder is a `Protocol` so we can swap blake2b (`FakeEncoder`,
 deterministic + offline tests) for `sentence-transformers` (production)

@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import typer
 from typer.testing import CliRunner
 
+from codex_atlas import cli as cli_mod
 from codex_atlas.cli import app
 
 runner = CliRunner()
@@ -118,3 +120,39 @@ class TestErrorHandling:
 def test_unknown_command_fails() -> None:
     result = runner.invoke(app, ["totally-not-a-command"])
     assert result.exit_code != 0
+
+
+class TestDebugReraise:
+    def test_bail_under_debug_reraises_original_exception(self) -> None:
+        # In --debug mode, _bail() should re-raise the original exception
+        # so that a debugger / runner can see the real traceback rather
+        # than a bare typer.Exit(1). We toggle _DEBUG directly because
+        # the only existing _bail() callsite (eval --baseline missing-file)
+        # requires a live Postgres to reach.
+        original = cli_mod._DEBUG
+        cli_mod._DEBUG = True
+        try:
+            err = FileNotFoundError("missing baseline")
+            try:
+                cli_mod._bail("baseline missing", err)
+            except FileNotFoundError as caught:
+                assert caught is err
+            else:  # pragma: no cover - defensive
+                raise AssertionError("_bail did not re-raise under --debug")
+        finally:
+            cli_mod._DEBUG = original
+
+    def test_bail_without_debug_raises_typer_exit(self) -> None:
+        # In normal mode (no --debug) _bail() falls back to typer.Exit(1)
+        # so the CLI surfaces a clean error rather than a stack trace.
+        original = cli_mod._DEBUG
+        cli_mod._DEBUG = False
+        try:
+            try:
+                cli_mod._bail("plain message")
+            except typer.Exit as e:
+                assert e.exit_code == 1
+            else:  # pragma: no cover - defensive
+                raise AssertionError("_bail did not raise typer.Exit")
+        finally:
+            cli_mod._DEBUG = original

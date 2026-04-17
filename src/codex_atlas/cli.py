@@ -50,12 +50,15 @@ def _root(
 
 
 def _bail(message: str, exc: Exception | None = None) -> None:
-    """Render an error nicely; in --debug mode include the traceback."""
+    """Render an error nicely; in --debug mode re-raise so the original
+    exception (and its full traceback) bubbles up for debuggers."""
+    console.print(f"[red bold]error[/] {message}")
     if _DEBUG and exc is not None:
-        console.print(f"[red bold]error[/] {message}")
         console.print(traceback.format_exc())
-    else:
-        console.print(f"[red bold]error[/] {message}")
+        # Re-raise so callers running under --debug get the original
+        # exception in the runner / pdb / launcher rather than a bare
+        # SystemExit. Wrapping with chaining preserves the message.
+        raise exc
     raise typer.Exit(code=1)
 
 

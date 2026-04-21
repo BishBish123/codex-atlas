@@ -143,16 +143,52 @@ class TestDebugReraise:
             cli_mod._DEBUG = original
 
     def test_bail_without_debug_raises_typer_exit(self) -> None:
-        # In normal mode (no --debug) _bail() falls back to typer.Exit(1)
-        # so the CLI surfaces a clean error rather than a stack trace.
+        # In normal mode (no --debug) _bail() defaults to typer.Exit(2)
+        # for user-input errors; an explicit exit_code can be passed for
+        # internal errors (1).
         original = cli_mod._DEBUG
         cli_mod._DEBUG = False
         try:
             try:
-                cli_mod._bail("plain message")
+                cli_mod._bail("plain user error")
+            except typer.Exit as e:
+                assert e.exit_code == 2
+            else:  # pragma: no cover - defensive
+                raise AssertionError("_bail did not raise typer.Exit")
+            try:
+                cli_mod._bail("plain internal error", exit_code=1)
             except typer.Exit as e:
                 assert e.exit_code == 1
             else:  # pragma: no cover - defensive
                 raise AssertionError("_bail did not raise typer.Exit")
         finally:
             cli_mod._DEBUG = original
+
+
+class TestExitCodes:
+    """User-input error paths must consistently exit 2."""
+
+    def test_missing_postgres_dsn_exits_2(self, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+        # `_dsn()` reads POSTGRES_DSN; missing env var is a user error
+        # and must surface as exit 2 (not 1). We call `_dsn()` directly
+        # rather than driving a full command via the runner because the
+        # async commands open extra resources that don't matter to this
+        # contract.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        original = cli_mod._DEBUG
+        cli_mod._DEBUG = False
+        try:
+            try:
+                cli_mod._dsn()
+            except typer.Exit as e:
+                assert e.exit_code == 2
+            else:  # pragma: no cover - defensive
+                raise AssertionError("_dsn did not raise typer.Exit")
+        finally:
+            cli_mod._DEBUG = original
+
+    def test_unknown_mcp_transport_exits_2(self) -> None:
+        # `atlas mcp --transport foo` is a bad CLI argument; typer's own
+        # BadParameter handling already produces exit 2 — pin that here.
+        result = runner.invoke(app, ["mcp", "--transport", "totally-bogus"])
+        assert result.exit_code == 2

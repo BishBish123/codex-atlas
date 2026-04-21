@@ -8,6 +8,7 @@ import os
 import sys
 import traceback
 from pathlib import Path
+from typing import NoReturn
 
 import typer
 from rich.console import Console
@@ -49,9 +50,17 @@ def _root(
     _DEBUG = debug
 
 
-def _bail(message: str, exc: Exception | None = None) -> None:
+def _bail(message: str, exc: Exception | None = None, exit_code: int = 2) -> NoReturn:
     """Render an error nicely; in --debug mode re-raise so the original
-    exception (and its full traceback) bubbles up for debuggers."""
+    exception (and its full traceback) bubbles up for debuggers.
+
+    Exit-code convention (matches the rest of the CLI):
+
+      * ``2`` — user-input error (bad args, missing file, malformed JSON,
+        baseline regression). This is the default.
+      * ``1`` — unexpected internal error (bug, unhandled exception).
+      * ``0`` — success (never reached via _bail).
+    """
     console.print(f"[red bold]error[/] {message}")
     if _DEBUG and exc is not None:
         console.print(traceback.format_exc())
@@ -59,7 +68,7 @@ def _bail(message: str, exc: Exception | None = None) -> None:
         # exception in the runner / pdb / launcher rather than a bare
         # SystemExit. Wrapping with chaining preserves the message.
         raise exc
-    raise typer.Exit(code=1)
+    raise typer.Exit(code=exit_code)
 
 
 def _resolve_encoder(name: str) -> Encoder:
@@ -73,8 +82,14 @@ def _resolve_encoder(name: str) -> Encoder:
 def _dsn() -> str:
     dsn = os.environ.get("POSTGRES_DSN")
     if not dsn:
-        raise typer.BadParameter(
-            "POSTGRES_DSN env var is required (e.g. postgresql://bench:bench@localhost:5433/bench)"
+        # User-input error — exit 2 (matches the convention in `_bail`).
+        # We use _bail rather than typer.BadParameter because BadParameter
+        # raised from inside an async coroutine propagates out as a
+        # generic exception (exit 1) in typer; _bail standardises the
+        # exit code regardless of where it is raised.
+        _bail(
+            "POSTGRES_DSN env var is required "
+            "(e.g. postgresql://bench:bench@localhost:5433/bench)"
         )
     return dsn
 

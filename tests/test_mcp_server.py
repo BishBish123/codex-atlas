@@ -15,6 +15,7 @@ import pytest
 from codex_atlas.indexer.ast_parser import ParsedFile, Symbol, SymbolKind
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.mcp_server import (
+    MAX_NEIGHBORHOOD_DEPTH,
     CallersResponse,
     CodebaseStats,
     NeighborhoodResponse,
@@ -93,6 +94,13 @@ class TestGetGraphNeighborhoodTool:
         resp = await get_graph_neighborhood("m.c", depth=2)
         assert "m.a" in resp.callers
         assert "m.b" in resp.callers
+
+    async def test_depth_clamped_at_max(self, fixture_graph: Path) -> None:
+        # Requests above MAX_NEIGHBORHOOD_DEPTH (8) are clamped at the MCP
+        # boundary so the call can't drag a 50K-node graph into a
+        # minute-long traversal. The response surfaces the clamped depth.
+        resp = await get_graph_neighborhood("m.b", depth=20)
+        assert resp.depth == MAX_NEIGHBORHOOD_DEPTH
 
 
 class TestCodebaseStatsResource:

@@ -21,6 +21,7 @@ Reads `POSTGRES_DSN`, `ATLAS_GRAPH_PATH`, `ATLAS_ENCODER` from env.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 
@@ -32,6 +33,16 @@ from codex_atlas.agent import Agent, AgentResult
 from codex_atlas.embed import Encoder, FakeEncoder
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.retriever import Retriever, RetrieverConfig
+
+# Hard cap on the BFS depth callers can request via
+# ``get_graph_neighborhood``. Even with seen-set guards a 50K-node graph
+# with depth=10000 walks far more than the caller could ever consume —
+# we clamp at the MCP boundary so a confused LLM can't trigger a
+# minute-long traversal. Eight hops covers the deepest realistic
+# "everything related to this symbol" question on the indexed corpus.
+MAX_NEIGHBORHOOD_DEPTH = 8
+
+_log = logging.getLogger(__name__)
 
 mcp: FastMCP = FastMCP(
     name="codex-atlas",
@@ -213,11 +224,27 @@ async def search_codebase(query: str, top_k: int = 8, route: str | None = None) 
 
 @mcp.tool
 async def get_graph_neighborhood(symbol: str, depth: int = 2) -> NeighborhoodResponse:
-    """Both-direction BFS on the call graph (callers + callees up to depth)."""
+    """Both-direction BFS on the call graph (callers + callees up to depth).
+
+    Depth is clamped at ``MAX_NEIGHBORHOOD_DEPTH`` (8) at the MCP
+    boundary; requests above the cap are reduced to the cap with a
+    structured warning rather than rejected, so a slightly-too-large
+    depth doesn't fail the tool call.
+    """
     if not symbol.strip():
         raise ValueError("symbol must not be blank")
     if depth <= 0:
         raise ValueError("depth must be positive")
+    if depth > MAX_NEIGHBORHOOD_DEPTH:
+        _log.warning(
+            "get_graph_neighborhood.depth_clamped",
+            extra={
+                "symbol": symbol,
+                "requested_depth": depth,
+                "clamped_depth": MAX_NEIGHBORHOOD_DEPTH,
+            },
+        )
+        depth = MAX_NEIGHBORHOOD_DEPTH
     nb = _graph().caller_callee_neighborhood(symbol, depth=depth)
     return NeighborhoodResponse(
         target=symbol,

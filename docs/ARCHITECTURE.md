@@ -175,3 +175,24 @@ JSONL so debugging is `cat | jq`.
 across Python 3.11 and 3.12 on every PR and main push. Concurrency
 groups cancel in-progress runs on the same ref. Permissions are
 limited to `contents: read`.
+
+## Limitations
+
+A short list of known gaps the indexer + retriever do *not* try to
+solve. Each is in scope for a later release; recording them here keeps
+the gap visible without polluting the test suite with x-fail markers.
+
+- **Star imports.** `from foo import *` is recorded as an `ImportRef`
+  with `local="*"` but never resolved. We do not enumerate the names
+  re-exported by `foo` (this would require importing the module at
+  index time, which the walker deliberately avoids — the AST parser is
+  pure-syntactic so it works on partially-broken corpora). Calls
+  resolved via a star-bound name fall back to the short-name index, so
+  the call edge is still recorded; only the *imports* edge is silently
+  unresolved. Guidance: `__all__`-driven re-exports are the supported
+  pattern.
+- **Dynamic dispatch.** Calls through `getattr(obj, name)(...)` or
+  registry-driven lookups (e.g. plugin systems) are invisible to the
+  AST parser. The graph captures only what the source spells out.
+- **Cross-language calls.** Python -> C extension transitions stop at
+  the FFI boundary; the graph is Python-only.

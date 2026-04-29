@@ -309,37 +309,58 @@ class CitationValidator:
 
     @staticmethod
     def _is_grounded(claim: str, cited: set[str], known_prefixes: set[str]) -> bool:
-        # 1. Exact match.
+        # 1. Exact match — strongest grounding signal.
         if claim in cited:
             return True
+
         # 2. Trailing-component match: some retrieved qname ends in
-        #    ``.<claim>``. Accept iff the leading prefix on the retrieved
-        #    qname can be matched by a known module/package — meaning the
-        #    "module" the claim implicitly belongs to was in fact retrieved.
-        #    This is the rule that rejects ``pkg_b.Cls.method`` when only
-        #    ``pkg_a.Cls.method`` was retrieved: the qname ``pkg_a.Cls.method``
-        #    ends in ``.Cls.method`` and ``pkg_a`` is a known prefix, but
-        #    that does NOT make a *different* claim ``pkg_b.Cls.method``
-        #    grounded. We therefore also require: if the claim itself has
-        #    a leading prefix (everything before the trailing component
-        #    path matched), that prefix must be in the known set.
+        #    ``.<claim>``. The intuition is that an answer can refer to
+        #    ``Cls.method`` while the retrieved qname is the fully
+        #    qualified ``pkg.module.Cls.method`` — same symbol, less
+        #    qualified. We accept this BUT only when:
+        #    (a) the claim has no dotted prefix of its own to verify
+        #        (e.g. ``Cls.method``, two parts) — there's no module
+        #        in the claim that could be a hallucination, OR
+        #    (b) the claim's own leading prefix is a known module, so
+        #        ``pkg.module.Cls.method`` claim grounds against
+        #        ``pkg.module.Cls.method`` retrieval AND we've seen
+        #        ``pkg.module`` as a known prefix.
+        #
+        #    Without (b), an answer claiming ``pkg_b.Cls.method`` would
+        #    be grounded by a retrieved ``pkg_a.Cls.method`` because
+        #    both share the trailing path ``.Cls.method`` — that's the
+        #    hallucination we explicitly want to reject.
         suffix = f".{claim}"
         for q in cited:
             if q.endswith(suffix):
-                # Claim was a true tail of a retrieved qname. Accept it
-                # only when the claim itself is a single trailing path
-                # (no dotted prefix of its own to verify) OR the claim's
-                # own leading prefix is a known module. ``Cls.method``
-                # has no module prefix on the *claim* side; the
-                # retrieved qname's prefix (``pkg.module``) is known by
-                # construction (it's in cited_qnames as a prefix).
-                return True
+                # Strip the matched suffix from the retrieved qname; the
+                # remainder is the retrieved module/package path.
+                retrieved_prefix = q[: -len(suffix)]
+                # How many dotted components does the claim itself
+                # contribute beyond the trailing symbol path? A claim
+                # ``Cls.method`` has one dot — purely a trailing path.
+                # ``pkg.Cls.method`` has two dots — the leading ``pkg``
+                # is a module assertion the validator must verify.
+                claim_parts = claim.split(".")
+                if len(claim_parts) <= 2:
+                    # Pure trailing path; no module asserted by the claim.
+                    return True
+                claim_module_prefix = ".".join(claim_parts[:-2])
+                # Either the claim's prefix is itself a known module, or
+                # it matches the retrieved qname's actual prefix (i.e.
+                # the same module the retrieval came from).
+                if (
+                    claim_module_prefix in known_prefixes
+                    or claim_module_prefix == retrieved_prefix
+                ):
+                    return True
+
         # 3. Containing match: claim is longer than any retrieved qname
-        #    and ends with one as a trailing path. Require claim's
-        #    leading prefix to be a known module/package — this is the
-        #    rule that catches the ``pkg_b.Cls.method`` attack when the
-        #    retrieved set only has ``pkg_a.Cls.method``: the claim's
-        #    prefix ``pkg_b`` is not in the prefix set.
+        #    and ends with one as a trailing path. Require the claim's
+        #    leading prefix to be a known module/package — this catches
+        #    the ``pkg_b.Cls.method`` attack when the retrieval set has
+        #    only the bare ``Cls.method``: the claim asserts a module
+        #    (``pkg_b``) that was never retrieved, so reject.
         for q in cited:
             tail = f".{q}"
             if claim.endswith(tail):

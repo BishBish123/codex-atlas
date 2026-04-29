@@ -153,6 +153,32 @@ class TestCitationValidator:
         assert report.is_acceptable
         assert "Cls.method" in report.grounded_qualified_names
 
+    async def test_validator_rejects_wrong_module_with_dotted_prefix(self) -> None:
+        # Codex strict-pass scenario: retrieved ``pkg_a.module.Cls.method``;
+        # answer asserts ``pkg_b.module.Cls.method``. Trailing path matches
+        # but the *claim's* leading module ``pkg_b.module`` is not a known
+        # prefix and does not equal the retrieved module ``pkg_a.module``.
+        # Must reject — this is the substring/suffix attack the rule is
+        # designed to catch when the claim itself carries module assertion.
+        validator = CitationValidator()
+        chunks = [_stored("pkg_a.module.Cls.method")]
+        answer = "look at `pkg_b.module.Cls.method` for the implementation"
+        report = await validator.validate("q", answer, chunks)
+        assert "pkg_b.module.Cls.method" in report.ungrounded_claims
+        assert not report.is_acceptable
+
+    async def test_validator_accepts_dotted_claim_when_module_known(self) -> None:
+        # Retrieved ``pkg_a.module.Cls.method`` (registers ``pkg_a`` and
+        # ``pkg_a.module`` and ``pkg_a.module.Cls`` as known prefixes).
+        # Answer cites ``pkg_a.module.Cls.method`` — module asserted by the
+        # claim matches the retrieval. Accept.
+        validator = CitationValidator()
+        chunks = [_stored("pkg_a.module.Cls.method")]
+        answer = "see `pkg_a.module.Cls.method`"
+        report = await validator.validate("q", answer, chunks)
+        assert report.is_acceptable
+        assert "pkg_a.module.Cls.method" in report.grounded_qualified_names
+
     async def test_zero_claims_logs_structured_event(self, caplog) -> None:  # type: ignore[no-untyped-def]
         # v0.2 policy: zero specific claims still passes, but we log it
         # so production traces can audit how often it happens.

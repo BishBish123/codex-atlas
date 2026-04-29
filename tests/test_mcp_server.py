@@ -643,3 +643,38 @@ class TestStartupValidation:
         monkeypatch.delenv("ATLAS_STORE", raising=False)
         monkeypatch.delenv("POSTGRES_DSN", raising=False)
         mcp_server.validate_startup_config()
+
+
+class TestGraphCacheReuse:
+    """``_graph()`` must cache the loaded ``CallGraph`` so direct callers
+    (``find_callers``, ``get_graph_neighborhood``, ``codebase_stats``)
+    don't re-deserialise ``data/graph.json`` on every tool invocation.
+
+    The earlier implementation only populated ``_cached_graph`` from
+    inside ``_agent()``. A client that drove the graph-only tools
+    without going through the LLM-backed agent paid full
+    ``CallGraph.load`` cost on every call. The fix promotes the cache
+    check into ``_graph()`` itself; this test pins it.
+    """
+
+    def test_repeated_calls_reuse_cache(self, fixture_graph: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Force the cache to a known empty starting point — other tests in
+        # this module run ``find_callers`` etc. and may have populated it.
+        monkeypatch.setattr(mcp_server, "_cached_graph", None, raising=False)
+        load_calls = {"n": 0}
+        real_load = CallGraph.load
+
+        def counting_load(path: Path) -> CallGraph:
+            load_calls["n"] += 1
+            return real_load(path)
+
+        monkeypatch.setattr(CallGraph, "load", staticmethod(counting_load))
+        # First call populates cache, second call must reuse it.
+        g1 = mcp_server._graph()
+        g2 = mcp_server._graph()
+        g3 = mcp_server._graph()
+        assert load_calls["n"] == 1, (
+            f"expected one CallGraph.load over three _graph() calls; got {load_calls['n']}"
+        )
+        # Identity check: cache must hand back the *same* object, not a clone.
+        assert g1 is g2 is g3

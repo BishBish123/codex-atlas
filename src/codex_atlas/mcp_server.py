@@ -135,10 +135,29 @@ def _encoder() -> Encoder:
 
 
 def _graph() -> CallGraph:
+    """Load the call graph, reusing the process-wide cache populated by
+    ``_agent()`` (or this function on first call).
+
+    Three MCP tools — ``find_callers``, ``get_graph_neighborhood``, and
+    ``codebase_stats`` — call ``_graph()`` directly without first going
+    through ``_agent()``. Without this short-circuit each invocation
+    paid a multi-second ``CallGraph.load`` (full JSON deserialisation)
+    on every call, defeating the cache that ``_agent()`` populates for
+    its own callers. Promoting the cache check to ``_graph()`` itself
+    means *any* caller benefits, regardless of which tool they entered
+    through. Concurrent first-callers may each load the graph and
+    overwrite ``_cached_graph`` once — the result is identical so the
+    race is benign and we avoid pulling the async ``_init_lock`` into
+    a sync function.
+    """
+    global _cached_graph  # noqa: PLW0603
+    if _cached_graph is not None:
+        return _cached_graph
     path = Path(os.environ.get("ATLAS_GRAPH_PATH", "data/graph.json"))
     if not path.exists():
         raise RuntimeError(f"call graph not found at {path}; run `atlas index` first")
-    return CallGraph.load(path)
+    _cached_graph = CallGraph.load(path)
+    return _cached_graph
 
 
 def _dsn() -> str:

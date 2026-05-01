@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from codex_atlas.indexer.ast_parser import ImportRef, ParsedFile, Symbol, SymbolKind
@@ -173,3 +175,83 @@ class TestImportChain:
         g = CallGraph()
         with pytest.raises(ValueError, match="max_depth"):
             g.import_chain("util", max_depth=0)
+
+
+class TestRelativeImportResolution:
+    """``from . import x`` / ``from ..pkg import y`` resolve to absolute targets."""
+
+    def test_relative_import_level_1_resolves(self) -> None:
+        # ``pkg.mod`` doing ``from . import other`` must resolve to ``pkg.other``.
+        # Without relative-import resolution the local name ``other`` would
+        # never reach a graph node, so the imports-aware path silently fails.
+        # We register the symbol ``pkg.other`` directly so a call to ``other()``
+        # records the exact imports-aware edge.
+        other = _parsed(module="pkg.other", syms=[_sym("pkg.other")], calls=[])
+        # Decoy: a top-level ``other`` symbol exists in the corpus. With the
+        # bug present, the short-name fallback would record TWO edges
+        # (``pkg.other`` AND ``other``); with relative-import resolution the
+        # imports-aware path wins and records exactly one.
+        decoy = _parsed(module="other", syms=[_sym("other")], calls=[])
+        mod = _parsed(
+            module="pkg.mod",
+            syms=[_sym("pkg.mod.run")],
+            calls=[("pkg.mod.run", "other")],
+            import_refs=[ImportRef(local="other", target="other", level=1)],
+        )
+        g = CallGraph()
+        g.ingest([other, decoy, mod])
+        # Only pkg.other — the relative import resolves to that exact node.
+        assert g.find_callees("pkg.mod.run") == ["pkg.other"]
+
+    def test_relative_import_level_2_resolves(self) -> None:
+        # ``pkg.sub.mod`` doing ``from .. import other`` should resolve to
+        # ``pkg.other``. We register a callable on pkg.other so the
+        # imports-aware path can record the exact edge.
+        other = _parsed(module="pkg.other", syms=[_sym("pkg.other")], calls=[])
+        mod = _parsed(
+            module="pkg.sub.mod",
+            syms=[_sym("pkg.sub.mod.run")],
+            calls=[("pkg.sub.mod.run", "other")],
+            import_refs=[ImportRef(local="other", target="other", level=2)],
+        )
+        g = CallGraph()
+        g.ingest([other, mod])
+        callees = sorted(g.find_callees("pkg.sub.mod.run"))
+        assert "pkg.other" in callees
+
+    def test_relative_import_with_target(self) -> None:
+        # ``pkg.sub.mod`` doing ``from ..util import helper`` -> ``pkg.util.helper``.
+        util = _parsed(module="pkg.util", syms=[_sym("pkg.util.helper")], calls=[])
+        # An unrelated module also has a ``helper`` so the short-name fallback
+        # would over-match — the test asserts the imports-aware path WINS.
+        decoy = _parsed(module="lib_b", syms=[_sym("lib_b.helper")], calls=[])
+        mod = _parsed(
+            module="pkg.sub.mod",
+            syms=[_sym("pkg.sub.mod.run")],
+            calls=[("pkg.sub.mod.run", "helper")],
+            import_refs=[ImportRef(local="helper", target="util.helper", level=2)],
+        )
+        g = CallGraph()
+        g.ingest([util, decoy, mod])
+        # Only pkg.util.helper — the relative import disambiguates.
+        assert g.find_callees("pkg.sub.mod.run") == ["pkg.util.helper"]
+
+    def test_relative_import_escaping_package_warns_and_skips(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # ``pkg`` (one part) doing ``from .. import x`` escapes the package —
+        # we can't reify it. The resolver should log a warning and skip.
+        # Short-name fallback still records edges so callers don't go silent.
+        other = _parsed(module="other", syms=[_sym("other.x")], calls=[])
+        mod = _parsed(
+            module="pkg",
+            syms=[_sym("pkg.run")],
+            calls=[("pkg.run", "x")],
+            import_refs=[ImportRef(local="x", target="x", level=2)],
+        )
+        g = CallGraph()
+        with caplog.at_level(logging.WARNING, logger="codex_atlas.indexer.graph"):
+            g.ingest([other, mod])
+        assert any("relative_import_escapes_package" in rec.message for rec in caplog.records)
+        # Short-name fallback still works.
+        assert g.find_callees("pkg.run") == ["other.x"]

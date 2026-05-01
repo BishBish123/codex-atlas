@@ -16,12 +16,15 @@ The persistence format is a single `.json` for portability + diffability
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable
 from pathlib import Path
 
 import networkx as nx
 
-from codex_atlas.indexer.ast_parser import ParsedFile, Symbol, SymbolKind
+from codex_atlas.indexer.ast_parser import ImportRef, ParsedFile, Symbol, SymbolKind
+
+_log = logging.getLogger(__name__)
 
 EDGE_CALLS = "calls"
 EDGE_IMPORTS = "imports"
@@ -81,11 +84,18 @@ class CallGraph:
                 unqualified_index.setdefault(short, set()).add(sym.qualified_name)
 
         # Per-module local-name -> dotted-target map for imports resolution.
+        # Relative imports (level >= 1) are reified to absolute targets here
+        # using the parsed file's own module_name as the anchor — without
+        # this, ``from . import x`` would never line up with the absolute
+        # qname recorded for ``x`` elsewhere in the corpus.
         imports_map: dict[str, dict[str, str]] = {}
         for pf in parsed_list:
             local_to_target: dict[str, str] = {}
             for ref in pf.import_refs:
-                local_to_target[ref.local] = ref.target
+                target = _resolve_import_target(pf.module_name, ref)
+                if target is None:
+                    continue
+                local_to_target[ref.local] = target
             imports_map[pf.module_name] = local_to_target
 
         # `defines`: module -> any class/function/method directly inside it.
@@ -234,3 +244,42 @@ class CallGraph:
         for e in payload["edges"]:
             g._g.add_edge(e["src"], e["dst"], kind=e.get("kind", ""))
         return g
+
+
+def _resolve_import_target(module_name: str, ref: ImportRef) -> str | None:
+    """Reify a relative ImportRef to its absolute dotted target.
+
+    Absolute imports (``level == 0``) are returned unchanged. Relative
+    imports (``level >= 1``) are anchored on the importing module's own
+    package: drop the last ``level`` parts of ``module_name``, then join
+    with ``ref.target`` if it is non-empty.
+
+    Returns ``None`` (and logs a warning) when a relative import escapes
+    the package — i.e. the importing module doesn't have enough package
+    parts to satisfy the requested level. The caller skips the entry so
+    the rest of the imports map keeps building.
+    """
+    if ref.level <= 0:
+        return ref.target
+    parts = module_name.split(".") if module_name else []
+    if ref.level > len(parts):
+        # Relative import escapes the package root — there is no sensible
+        # absolute target. Skip with a structured warning rather than
+        # synthesising a name that can't possibly resolve.
+        # ``module`` and ``level`` are reserved LogRecord attribute names —
+        # use namespaced keys so the logging machinery can attach them to
+        # the record without raising KeyError.
+        _log.warning(
+            "graph.relative_import_escapes_package",
+            extra={
+                "import_module": module_name,
+                "import_level": ref.level,
+                "import_target": ref.target,
+                "import_local": ref.local,
+            },
+        )
+        return None
+    base_parts = parts[: len(parts) - ref.level]
+    absolute_parts = [*base_parts, ref.target] if ref.target else base_parts
+    absolute = ".".join(p for p in absolute_parts if p)
+    return absolute or None

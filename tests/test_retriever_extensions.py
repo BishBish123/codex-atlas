@@ -212,3 +212,30 @@ class TestHybridScorer:
             graph_distances={},
         )
         assert isinstance(out[0], HybridScore)
+
+
+class TestRouteOverride:
+    """Explicit ``route_override`` skips the classifier and runs the named route."""
+
+    async def test_override_skips_classifier(self) -> None:
+        # The query ``what does b do`` would normally classify as LOOKUP
+        # (no structural triggers, no import-chain phrasing). With the
+        # override the retriever runs the structural pipeline anyway.
+        store = AsyncMock()
+        store.fetch_by_qualified_name.side_effect = _stored
+        store.search.return_value = [_stored("m.a")]
+        r = Retriever(FakeEncoder(dim=8), store, _mk_graph(), RetrieverConfig(top_k=10))
+        result = await r.retrieve("what does m.b do", route_override=Route.STRUCTURAL)
+        assert result.route is Route.STRUCTURAL
+        # Classifier was bypassed — confidence is the synthesised 1.0 and
+        # signals carry the override marker.
+        assert result.confidence == 1.0
+        assert "route_override" in result.signals
+
+    async def test_no_override_uses_classifier(self) -> None:
+        store = AsyncMock()
+        store.search.return_value = [_stored("m.a")]
+        r = Retriever(FakeEncoder(dim=8), store, _mk_graph(), RetrieverConfig(top_k=2))
+        result = await r.retrieve("what does m.b do")
+        # Default lookup classification.
+        assert result.route is Route.LOOKUP

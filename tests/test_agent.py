@@ -37,7 +37,9 @@ class StubRetriever:
     responses: list[RetrievalResult]
     calls: int = 0
 
-    async def retrieve(self, query: str) -> RetrievalResult:
+    async def retrieve(
+        self, query: str, *, route_override: Route | None = None
+    ) -> RetrievalResult:
         r = self.responses[min(self.calls, len(self.responses) - 1)]
         self.calls += 1
         return r

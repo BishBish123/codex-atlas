@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from codex_atlas.agent import Agent, AgentResult
 from codex_atlas.embed import Encoder, FakeEncoder
 from codex_atlas.indexer.graph import CallGraph
-from codex_atlas.retriever import Retriever, RetrieverConfig
+from codex_atlas.retriever import Retriever, RetrieverConfig, Route
 
 # Hard cap on the BFS depth callers can request via
 # ``get_graph_neighborhood``. Even with seen-set guards a 50K-node graph
@@ -207,9 +207,11 @@ async def search_codebase(query: str, top_k: int = 8, route: str | None = None) 
     """Generic search with an optional explicit route override.
 
     Pass ``route="structural"`` (or any ``Route`` value) to skip the
-    classifier — useful when the calling LLM has already decided which
-    pipeline it wants. With ``route=None`` this is identical to
-    ``search_code``.
+    classifier and run the named retrieval pipeline directly — useful
+    when the calling LLM has already decided which pipeline it wants.
+    With ``route=None`` this is identical to ``search_code``. Unknown
+    route names raise ``ValueError`` rather than silently falling
+    through to the classifier.
     """
     if top_k <= 0:
         raise ValueError("top_k must be positive")
@@ -217,19 +219,15 @@ async def search_codebase(query: str, top_k: int = 8, route: str | None = None) 
         raise ValueError("top_k must be <= 50")
     if not query.strip():
         raise ValueError("query must not be blank")
+    override: Route | None = None
+    if route is not None:
+        try:
+            override = Route(route)
+        except ValueError as e:
+            valid = ", ".join(r.value for r in Route)
+            raise ValueError(f"unknown route {route!r}; expected one of: {valid}") from e
     agent = await _agent(top_k=top_k)
-    if route is None:
-        return _to_response(await agent.run(query))
-    # Force a route by phrasing the query so the classifier picks it.
-    forced = {
-        "structural": f"who calls {query}",
-        "summarization": f"walk me through {query}",
-        "hybrid": f"end-to-end {query}",
-        "neighborhood": f"neighborhood of {query}",
-        "import_chain": f"who imports {query}",
-        "lookup": query,
-    }.get(route, query)
-    return _to_response(await agent.run(forced))
+    return _to_response(await agent.run(query, route_override=override))
 
 
 @mcp.tool

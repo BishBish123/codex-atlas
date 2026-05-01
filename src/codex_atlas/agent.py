@@ -149,6 +149,8 @@ class _State:
     trace: list[TraceEvent] = field(default_factory=list)
     tool_calls: list[ToolCall] = field(default_factory=list)
     cancelled: CancelReason | None = None
+    # Set when the caller wants to skip classification for this run.
+    route_override: Route | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -431,9 +433,15 @@ class Agent:
         self._validator = validator or CitationValidator()
         self._config = config or AgentConfig()
 
-    async def run(self, query: str) -> AgentResult:
+    async def run(self, query: str, *, route_override: Route | None = None) -> AgentResult:
+        """Run the state machine; optionally skip the classifier.
+
+        ``route_override`` is forwarded to the retriever so callers (e.g.
+        the MCP ``search_codebase(route=...)`` tool) can force a route
+        without resorting to query rewording.
+        """
         run_t0 = time.perf_counter()
-        state = _State(original_query=query, query=query)
+        state = _State(original_query=query, query=query, route_override=route_override)
         try:
             await self._with_run_deadline(self._retrieve(state), run_t0)
             await self._with_run_deadline(self._grade(state), run_t0)
@@ -503,7 +511,9 @@ class Agent:
 
     async def _retrieve(self, state: _State) -> None:
         t0 = time.perf_counter()
-        retrieval = await self._with_step_deadline(self._retriever.retrieve(state.query))
+        retrieval = await self._with_step_deadline(
+            self._retriever.retrieve(state.query, route_override=state.route_override)
+        )
         state.retrieval = retrieval
         elapsed = (time.perf_counter() - t0) * 1000.0
         state.trace.append(

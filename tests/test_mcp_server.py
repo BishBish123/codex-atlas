@@ -119,22 +119,21 @@ class TestCodebaseStatsResource:
 
 @dataclass
 class _StubAgent:
-    """Records the query it received so tests can assert on it."""
+    """Records the query + route_override it received so tests can assert."""
 
     queries: list[str] = field(default_factory=list)
+    overrides: list[Route | None] = field(default_factory=list)
     chunks_returned: int = 0
 
-    async def run(self, query: str) -> AgentResult:
+    async def run(self, query: str, *, route_override: Route | None = None) -> AgentResult:
         self.queries.append(query)
-        # Return an AgentResult that respects the recorded top_k cap by
-        # producing N empty citations — the MCP layer caps these via the
-        # retriever, not here, so we just verify the shape.
+        self.overrides.append(route_override)
         return AgentResult(
             query=query,
             final_query=query,
             answer="stub",
             citations=[],
-            route=Route.LOOKUP,
+            route=route_override or Route.LOOKUP,
             grade=1.0,
             attempts=1,
             trace=[],
@@ -185,6 +184,35 @@ class TestSearchCodebaseTopK:
     async def test_search_codebase_top_k_too_large_rejected(self) -> None:
         with pytest.raises(ValueError, match="top_k"):
             await search_codebase("anything", top_k=200)
+
+
+class TestSearchCodebaseRouteOverride:
+    async def test_route_override_skips_classifier(
+        self, stub_agent_factory: dict[str, object]
+    ) -> None:
+        # Pick a query the heuristic classifier would NOT normally route to
+        # graph_walk: a bare lookup-style "what does X do" question. With
+        # ``route="structural"`` the override must be threaded through —
+        # the agent receives the verbatim query (no rewording) AND the
+        # explicit route_override.
+        await search_codebase("what does helper do", route="structural")
+        agent = stub_agent_factory["agent"]
+        assert isinstance(agent, _StubAgent)
+        assert agent.overrides == [Route.STRUCTURAL]
+        # Verbatim query — no classifier-bait rewording.
+        assert agent.queries == ["what does helper do"]
+
+    async def test_route_override_none_passes_through(
+        self, stub_agent_factory: dict[str, object]
+    ) -> None:
+        await search_codebase("anything", route=None)
+        agent = stub_agent_factory["agent"]
+        assert isinstance(agent, _StubAgent)
+        assert agent.overrides == [None]
+
+    async def test_unknown_route_rejected(self) -> None:
+        with pytest.raises(ValueError, match="unknown route"):
+            await search_codebase("anything", route="not_a_route")
 
 
 class TestModelShapes:

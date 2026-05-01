@@ -258,8 +258,23 @@ class Retriever:
         self._graph = graph
         self._config = config or RetrieverConfig()
 
-    async def retrieve(self, query: str) -> RetrievalResult:
-        decision = classify(query)
+    async def retrieve(self, query: str, *, route_override: Route | None = None) -> RetrievalResult:
+        """Run retrieval; optionally skip the classifier with ``route_override``.
+
+        When ``route_override`` is supplied the classifier is bypassed and
+        the named route runs verbatim. The returned ``RoutingDecision`` is
+        synthesised so downstream consumers (eval harness, traces) still
+        see a structured route + confidence — confidence is fixed at 1.0
+        because the caller asserted the choice.
+        """
+        if route_override is not None:
+            decision = RoutingDecision(
+                route=route_override,
+                confidence=1.0,
+                signals=["route_override"],
+            )
+        else:
+            decision = classify(query)
         match decision.route:
             case Route.LOOKUP:
                 chunks = await self._vector_topk(query, self._config.top_k)

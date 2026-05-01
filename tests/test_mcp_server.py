@@ -8,10 +8,13 @@ validation rejects bad arguments.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from codex_atlas import mcp_server
+from codex_atlas.agent import AgentResult
 from codex_atlas.indexer.ast_parser import ParsedFile, Symbol, SymbolKind
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.mcp_server import (
@@ -22,7 +25,10 @@ from codex_atlas.mcp_server import (
     codebase_stats,
     find_callers,
     get_graph_neighborhood,
+    search_code,
+    search_codebase,
 )
+from codex_atlas.retriever import Route
 
 
 def _sym(qname: str) -> Symbol:
@@ -109,6 +115,76 @@ class TestCodebaseStatsResource:
         assert isinstance(stats, CodebaseStats)
         assert stats.n_nodes >= 4
         assert stats.language == "python"
+
+
+@dataclass
+class _StubAgent:
+    """Records the query it received so tests can assert on it."""
+
+    queries: list[str] = field(default_factory=list)
+    chunks_returned: int = 0
+
+    async def run(self, query: str) -> AgentResult:
+        self.queries.append(query)
+        # Return an AgentResult that respects the recorded top_k cap by
+        # producing N empty citations — the MCP layer caps these via the
+        # retriever, not here, so we just verify the shape.
+        return AgentResult(
+            query=query,
+            final_query=query,
+            answer="stub",
+            citations=[],
+            route=Route.LOOKUP,
+            grade=1.0,
+            attempts=1,
+            trace=[],
+        )
+
+
+@pytest.fixture
+def stub_agent_factory(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Replace ``_agent`` with a stub that records the ``top_k`` passed in."""
+    captured: dict[str, object] = {"top_k": None, "agent": None}
+
+    async def fake_agent(top_k: int = 8) -> _StubAgent:
+        captured["top_k"] = top_k
+        agent = _StubAgent()
+        captured["agent"] = agent
+        return agent
+
+    monkeypatch.setattr(mcp_server, "_agent", fake_agent)
+    return captured
+
+
+class TestSearchCodeTopK:
+    async def test_search_code_respects_top_k(
+        self, stub_agent_factory: dict[str, object]
+    ) -> None:
+        # The MCP tool must thread the user-supplied top_k all the way down
+        # to ``_agent``; previously it was hardcoded to 8 and the user
+        # parameter was validated then ignored.
+        await search_code("anything", top_k=3)
+        assert stub_agent_factory["top_k"] == 3
+
+    async def test_search_code_top_k_zero_rejected(self) -> None:
+        with pytest.raises(ValueError, match="top_k"):
+            await search_code("anything", top_k=0)
+
+    async def test_search_code_top_k_too_large_rejected(self) -> None:
+        with pytest.raises(ValueError, match="top_k"):
+            await search_code("anything", top_k=51)
+
+
+class TestSearchCodebaseTopK:
+    async def test_search_codebase_respects_top_k(
+        self, stub_agent_factory: dict[str, object]
+    ) -> None:
+        await search_codebase("anything", top_k=5)
+        assert stub_agent_factory["top_k"] == 5
+
+    async def test_search_codebase_top_k_too_large_rejected(self) -> None:
+        with pytest.raises(ValueError, match="top_k"):
+            await search_codebase("anything", top_k=200)
 
 
 class TestModelShapes:

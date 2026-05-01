@@ -120,13 +120,19 @@ def _dsn() -> str:
     return dsn
 
 
-async def _agent() -> Agent:
+async def _agent(top_k: int = 8) -> Agent:
+    """Build a fresh agent for one request.
+
+    ``top_k`` is built into the per-request ``RetrieverConfig`` rather
+    than overlaid on a cached agent — clearer ownership and no shared
+    mutable state across concurrent calls.
+    """
     from codex_atlas.store import ChunkStore  # noqa: PLC0415
 
     encoder = _encoder()
     store = ChunkStore(dsn=_dsn())
     await store.setup(dim=encoder.dim)
-    retriever = Retriever(encoder, store, _graph(), RetrieverConfig(top_k=8))
+    retriever = Retriever(encoder, store, _graph(), RetrieverConfig(top_k=top_k))
     return Agent(retriever)
 
 
@@ -156,7 +162,9 @@ async def search_code(query: str, top_k: int = 8) -> SearchResponse:
     """Adaptive-route code search. Returns synthesised answer + citations."""
     if top_k <= 0:
         raise ValueError("top_k must be positive")
-    agent = await _agent()
+    if top_k > 50:
+        raise ValueError("top_k must be <= 50")
+    agent = await _agent(top_k=top_k)
     return _to_response(await agent.run(query))
 
 
@@ -205,9 +213,11 @@ async def search_codebase(query: str, top_k: int = 8, route: str | None = None) 
     """
     if top_k <= 0:
         raise ValueError("top_k must be positive")
+    if top_k > 50:
+        raise ValueError("top_k must be <= 50")
     if not query.strip():
         raise ValueError("query must not be blank")
-    agent = await _agent()
+    agent = await _agent(top_k=top_k)
     if route is None:
         return _to_response(await agent.run(query))
     # Force a route by phrasing the query so the classifier picks it.

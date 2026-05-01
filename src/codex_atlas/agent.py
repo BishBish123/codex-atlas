@@ -37,7 +37,7 @@ import time
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 from codex_atlas.retriever import RetrievalResult, Retriever, Route
 from codex_atlas.store import StoredChunk
@@ -55,6 +55,19 @@ class Node(StrEnum):
     ANSWER = "answer"
     VALIDATE = "validate"
     CANCEL = "cancel"
+
+
+# Whole-of-answer policy applied after the validator decides the answer
+# is unacceptable. ``advisory`` is the historical behaviour (log + return
+# verbatim); ``redact`` rewrites the answer, replacing each ungrounded
+# claim with a marker; ``reject`` replaces the answer with a refusal.
+ValidationMode = Literal["advisory", "redact", "reject"]
+
+
+_REJECT_MESSAGE = (
+    "I could not produce a grounded answer for that query. "
+    "Validation flagged ungrounded claims that aren't backed by the retrieved code."
+)
 
 
 class CancelReason(StrEnum):
@@ -412,6 +425,19 @@ class AgentConfig:
     step_timeout_s: float | None = None
     # Whole-run timeout (across all retries). None disables.
     run_timeout_s: float | None = None
+    # What to do when the validator flags the answer as ungrounded:
+    #
+    #   * ``redact`` (default): replace each ungrounded backticked claim
+    #     with ``[ungrounded: <claim>]`` and log the action. The answer
+    #     stays useful where it was grounded; readers see exactly which
+    #     claims failed validation.
+    #   * ``reject``: replace the entire answer with a refusal message.
+    #     Use when downstream consumers must never see partial-grounded
+    #     content.
+    #   * ``advisory``: legacy behaviour — log + return the answer
+    #     verbatim. Kept for callers that want the validator as a signal
+    #     only, e.g. to render a warning banner.
+    validation_mode: ValidationMode = "redact"
 
 
 class Agent:
@@ -460,6 +486,11 @@ class Agent:
                 validation = await self._with_run_deadline(
                     self._validate(state, answer, citations), run_t0
                 )
+                # Enforce the configured policy when validation rejects.
+                # ``_apply_validation`` is a pure transform — the original
+                # report is preserved on the result so callers can still
+                # see what was flagged.
+                answer = self._apply_validation(state, answer, validation)
             else:
                 answer, citations, validation = ("", [], None)
         except _Cancelled as exc:
@@ -643,3 +674,49 @@ class Agent:
             )
         )
         return report
+
+    def _apply_validation(
+        self, state: _State, answer: str, report: ValidationReport
+    ) -> str:
+        """Apply the configured validation_mode to an answer.
+
+        Returns the (possibly modified) answer. ``advisory`` and accepted
+        answers pass through unchanged; ``redact`` rewrites flagged
+        claims; ``reject`` replaces the entire answer.
+        """
+        if report.is_acceptable:
+            return answer
+        mode = self._config.validation_mode
+        # Always log the enforcement action so production traces can
+        # audit how often each mode fires and which claims tripped it.
+        _log.info(
+            "agent.validation_action",
+            extra={
+                "agent_query": state.original_query,
+                "agent_validation_mode": mode,
+                "agent_n_claims": report.n_claims,
+                "agent_n_grounded": report.n_grounded,
+                "agent_ungrounded_count": len(report.ungrounded_claims),
+            },
+        )
+        state.trace.append(
+            TraceEvent(
+                node=Node.VALIDATE,
+                started_at=time.perf_counter(),
+                elapsed_ms=0.0,
+                detail=(
+                    f"action={mode} ungrounded={len(report.ungrounded_claims)}"
+                ),
+            )
+        )
+        if mode == "advisory":
+            return answer
+        if mode == "reject":
+            return _REJECT_MESSAGE
+        # ``redact``: rewrite each ungrounded backticked claim. We replace
+        # the wrapped form ``\`<claim>\``` with ``[ungrounded: <claim>]``
+        # so the marker is unambiguous against the original code style.
+        out = answer
+        for claim in report.ungrounded_claims:
+            out = out.replace(f"`{claim}`", f"[ungrounded: {claim}]")
+        return out

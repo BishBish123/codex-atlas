@@ -13,6 +13,7 @@ from codex_atlas.agent import (
     CitationValidator,
     Node,
     ValidationReport,
+    Validator,
 )
 from codex_atlas.indexer.ast_parser import SymbolKind
 from codex_atlas.retriever import RetrievalResult, Route
@@ -282,3 +283,111 @@ class TestCancelOnTimeout:
         )
         result = await agent.run("q")
         assert result.cancelled is None
+
+
+@dataclass
+class _RejectingValidator:
+    """Test double that always reports the answer as unacceptable."""
+
+    ungrounded: list[str]
+
+    async def validate(
+        self, query: str, answer: str, chunks: list  # type: ignore[type-arg]
+    ) -> ValidationReport:
+        return ValidationReport(
+            n_claims=len(self.ungrounded) + 1,
+            n_grounded=1,
+            ungrounded_claims=list(self.ungrounded),
+            grounded_qualified_names=["m.foo"],
+            is_acceptable=False,
+        )
+
+
+@dataclass
+class _PassingValidator:
+    async def validate(
+        self, query: str, answer: str, chunks: list  # type: ignore[type-arg]
+    ) -> ValidationReport:
+        return ValidationReport(
+            n_claims=1,
+            n_grounded=1,
+            ungrounded_claims=[],
+            grounded_qualified_names=["m.foo"],
+            is_acceptable=True,
+        )
+
+
+@dataclass
+class _FixedAnswerSynth:
+    """Synthesiser that returns a hand-crafted string regardless of inputs."""
+
+    text: str
+
+    async def synthesize(self, query: str, chunks: list) -> str:  # type: ignore[type-arg]
+        return self.text
+
+
+class TestValidationModeEnforcement:
+    async def test_redact_mode_replaces_ungrounded_claims(self) -> None:
+        # Default mode is ``redact``. The validator flags ``m.ghost`` as
+        # ungrounded; the agent must rewrite the answer with the marker
+        # in place of the original backticked claim.
+        retriever = StubRetriever(responses=[_result([_stored("m.foo")])])
+        validator: Validator = _RejectingValidator(ungrounded=["m.ghost"])
+        synth = _FixedAnswerSynth(text="see `m.foo` and `m.ghost` together")
+        agent = Agent(
+            retriever,  # type: ignore[arg-type]
+            synthesizer=synth,  # type: ignore[arg-type]
+            validator=validator,
+        )
+        result = await agent.run("q")
+        assert "[ungrounded: m.ghost]" in result.answer
+        assert "`m.ghost`" not in result.answer
+        # Grounded claims survive verbatim.
+        assert "`m.foo`" in result.answer
+        # Validation report still surfaces the original failure.
+        assert result.validation is not None
+        assert "m.ghost" in result.validation.ungrounded_claims
+
+    async def test_reject_mode_returns_refusal(self) -> None:
+        retriever = StubRetriever(responses=[_result([_stored("m.foo")])])
+        validator: Validator = _RejectingValidator(ungrounded=["m.ghost"])
+        synth = _FixedAnswerSynth(text="see `m.ghost`")
+        agent = Agent(
+            retriever,  # type: ignore[arg-type]
+            synthesizer=synth,  # type: ignore[arg-type]
+            validator=validator,
+            config=AgentConfig(validation_mode="reject"),
+        )
+        result = await agent.run("q")
+        # The fabricated answer is replaced with a refusal sentence.
+        assert "could not produce a grounded answer" in result.answer
+        assert "`m.ghost`" not in result.answer
+
+    async def test_advisory_mode_passes_through(self) -> None:
+        # Backward-compat: advisory keeps the verbatim answer even when
+        # the validator flagged it.
+        retriever = StubRetriever(responses=[_result([_stored("m.foo")])])
+        validator: Validator = _RejectingValidator(ungrounded=["m.ghost"])
+        synth = _FixedAnswerSynth(text="see `m.ghost`")
+        agent = Agent(
+            retriever,  # type: ignore[arg-type]
+            synthesizer=synth,  # type: ignore[arg-type]
+            validator=validator,
+            config=AgentConfig(validation_mode="advisory"),
+        )
+        result = await agent.run("q")
+        assert result.answer == "see `m.ghost`"
+
+    async def test_acceptable_validation_passes_through_in_redact_mode(self) -> None:
+        # Even in redact mode, an accepted answer is unchanged.
+        retriever = StubRetriever(responses=[_result([_stored("m.foo")])])
+        validator: Validator = _PassingValidator()
+        synth = _FixedAnswerSynth(text="see `m.foo`")
+        agent = Agent(
+            retriever,  # type: ignore[arg-type]
+            synthesizer=synth,  # type: ignore[arg-type]
+            validator=validator,
+        )
+        result = await agent.run("q")
+        assert result.answer == "see `m.foo`"

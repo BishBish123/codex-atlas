@@ -84,16 +84,22 @@
 
 - **Refusal questions still score recall=0** — the harness wants the
   agent to return *no* citations for a refusal question. The agent
-  currently always returns whatever vector top-k surfaced. Refusal
-  behaviour is a known v1 gap; the new `validate` step in `agent.py`
-  is the foundation for fixing it (reject ungrounded answers, return
-  the empty-result message).
+  currently always returns whatever vector top-k surfaced. The
+  validator now enforces a configurable policy on ungrounded answers
+  (`AgentConfig.validation_mode`):
+  * `redact` (default): each ungrounded backticked claim is rewritten
+    to `[ungrounded: <claim>]`. The answer keeps its grounded body;
+    flagged claims become unmistakably visible to the reader.
+  * `reject`: the entire answer is replaced with a refusal sentence.
+  * `advisory`: legacy behaviour — log the failure, return the answer
+    verbatim (kept for callers that want the validator as a signal
+    only, e.g. to render a warning banner client-side).
 
 ## 7-mode failure taxonomy
 
 | # | Failure | Detection | Mitigation | Status |
 | --- | --- | --- | --- | --- |
-| 1 | Hallucinated citations | Validate that every cited qname exists in the call graph | `CitationValidator.validate` rejects ungrounded claims | mitigated |
+| 1 | Hallucinated citations | Validate that every cited qname exists in the call graph | `CitationValidator` flags ungrounded claims; `Agent` enforces them via `validation_mode=redact` (default), `reject`, or `advisory` | mitigated |
 | 2 | Wrong route chosen | `route_correctness` per-category in this report | Add the missing trigger phrase, or promote classifier to LLM | partial — explicit miss in `hybrid-1` |
 | 3 | Stale embeddings post-refactor | Index commit-sha as metadata; refuse if drift > N | TODO; v1 still proceeds without checking | known |
 | 4 | Re-query loop never converges | Hard cap at `max_attempts` + step/run timeouts | Implemented (`AgentConfig.max_attempts=3`, `step_timeout_s`, `run_timeout_s`) | mitigated |

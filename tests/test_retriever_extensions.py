@@ -214,6 +214,69 @@ class TestHybridScorer:
         assert isinstance(out[0], HybridScore)
 
 
+class TestHybridUsesScorer:
+    """``_hybrid`` ranks via ``hybrid_score``, not discovery order."""
+
+    async def test_hybrid_prefers_scorer_top_match(self) -> None:
+        # Two seeds with very different cosine. Discovery order would
+        # have put both into the result in seed order; the scorer should
+        # rank the higher-cosine chunk first.
+        seeds = [
+            _stored("m.a", score=0.10, text="alpha"),
+            _stored("m.b", score=0.95, text="beta"),
+        ]
+        store = AsyncMock()
+        store.search.return_value = seeds
+        store.fetch_by_qualified_name.side_effect = _stored
+        r = Retriever(
+            FakeEncoder(dim=8),
+            store,
+            _mk_graph(),
+            RetrieverConfig(
+                top_k=2,
+                # All weight on cosine for a clean assertion.
+                hybrid_weight_cosine=1.0,
+                hybrid_weight_graph=0.0,
+                hybrid_weight_fulltext=0.0,
+            ),
+        )
+        result = await r.retrieve("show me all auth-related code")
+        assert result.route is Route.HYBRID
+        # Highest-cosine seed wins regardless of original ordering.
+        assert result.chunks[0].qualified_name == "m.b"
+
+
+class TestSummarizationMaterialisesExpansions:
+    """``_summarization`` returns chunks for both seed AND graph neighbours."""
+
+    async def test_returns_neighbour_chunks(self) -> None:
+        # Graph: m.a -> m.b -> m.c. Seed = m.a; neighbours within 2 hops
+        # are m.b and m.c. The summarisation route must fetch chunks for
+        # the neighbours so the synthesiser sees their code.
+        seed = [_stored("m.a")]
+        store = AsyncMock()
+        store.search.return_value = seed
+        # Return a stored chunk for any qname asked for so the test can
+        # observe which neighbours were materialised.
+        store.fetch_by_qualified_name.side_effect = _stored
+        r = Retriever(
+            FakeEncoder(dim=8),
+            store,
+            _mk_graph(),
+            RetrieverConfig(summary_top_k=8, top_k=4),
+        )
+        result = await r.retrieve("walk me through m")
+        assert result.route is Route.SUMMARIZATION
+        names = {c.qualified_name for c in result.chunks}
+        # Seed plus 2-hop neighbours.
+        assert "m.a" in names
+        assert "m.b" in names
+        assert "m.c" in names
+        # The store was asked to fetch each of the expansion qnames.
+        fetched = {call.args[0] for call in store.fetch_by_qualified_name.call_args_list}
+        assert {"m.b", "m.c"}.issubset(fetched)
+
+
 class TestRouteOverride:
     """Explicit ``route_override`` skips the classifier and runs the named route."""
 

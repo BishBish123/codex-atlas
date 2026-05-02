@@ -322,9 +322,19 @@ class Retriever:
         return chunks, related
 
     async def _hybrid(self, query: str) -> tuple[list[StoredChunk], list[str]]:
+        # Stage 1: vector top-k for the seed. Stage 2: 1-hop graph
+        # neighbours. Stage 3: rank the union with ``hybrid_score`` so
+        # cosine, graph proximity, and term overlap all contribute —
+        # otherwise the seed-then-append order produced by stages 1+2
+        # would dominate even when an expanded neighbour is a better
+        # match. We keep the discovery-order ``expansions`` list as the
+        # auxiliary "extras" return so the agent can still see the
+        # neighbour names, irrespective of the ranking cut.
         seed = await self._vector_topk(query, self._config.top_k)
-        seen = {c.qualified_name for c in seed}
+        seed_qnames = {c.qualified_name for c in seed}
+        graph_distances: dict[str, int] = dict.fromkeys(seed_qnames, 0)
         expansions: list[str] = []
+        seen = set(seed_qnames)
         for c in seed:
             for neighbour in self._graph.neighbors(
                 c.qualified_name, depth=self._config.graph_depth
@@ -332,17 +342,38 @@ class Retriever:
                 if neighbour not in seen:
                     expansions.append(neighbour)
                     seen.add(neighbour)
-        # Materialise the first few expansions as chunks so the agent has
-        # the actual code, not just names.
+                    graph_distances[neighbour] = self._config.graph_depth
+        # Materialise the expansions so the ranker sees real chunk text.
+        candidates: list[StoredChunk] = list(seed)
         for q in expansions[: self._config.top_k]:
             extra = await self._store.fetch_by_qualified_name(q)
             if extra is not None:
-                seed.append(extra)
-        return seed, expansions
+                candidates.append(extra)
+        weights = (
+            self._config.hybrid_weight_cosine,
+            self._config.hybrid_weight_graph,
+            self._config.hybrid_weight_fulltext,
+        )
+        scored = hybrid_score(
+            candidates,
+            query=query,
+            seeds=seed_qnames,
+            graph_distances=graph_distances,
+            weights=weights,
+        )
+        # Reorder ``candidates`` to match the ranked output, keep top-k.
+        order = {s.qualified_name: i for i, s in enumerate(scored)}
+        candidates.sort(key=lambda c: order.get(c.qualified_name, len(order)))
+        return candidates[: self._config.top_k], expansions
 
     async def _summarization(self, query: str) -> tuple[list[StoredChunk], list[str]]:
-        # Pull a wider net, then expand once via graph neighbours so the
-        # synthesis prompt sees both the seed chunks and their context.
+        # Pull a wider net, then expand 2 hops via graph neighbours so
+        # the synthesis prompt sees both the seed chunks AND the actual
+        # code of their context (not just the names). Without
+        # materialisation the synthesiser only ever saw the seed, which
+        # made the summarisation route indistinguishable from a wider
+        # lookup — README and ADRs both promised "wider top-k + 2-hop
+        # graph neighbours", so this delivers the second half.
         seed = await self._vector_topk(query, self._config.summary_top_k)
         seen = {c.qualified_name for c in seed}
         expansions: list[str] = []
@@ -351,7 +382,15 @@ class Retriever:
                 if neighbour not in seen:
                     expansions.append(neighbour)
                     seen.add(neighbour)
-        return seed, expansions
+        # Materialise expansion chunks via the store. Bounded by
+        # ``summary_top_k`` so a hub symbol with many neighbours can't
+        # blow up the prompt.
+        materialised: list[StoredChunk] = list(seed)
+        for q in expansions[: self._config.summary_top_k]:
+            extra = await self._store.fetch_by_qualified_name(q)
+            if extra is not None:
+                materialised.append(extra)
+        return materialised, expansions
 
     async def _neighborhood(self, query: str) -> tuple[list[StoredChunk], list[str]]:
         target = _extract_qualified_name(query, self._graph)

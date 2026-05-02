@@ -120,19 +120,38 @@ def _dsn() -> str:
     return dsn
 
 
+_cached_store: object | None = None
+_cached_encoder: Encoder | None = None
+_cached_graph: CallGraph | None = None
+
+
 async def _agent(top_k: int = 8) -> Agent:
-    """Build a fresh agent for one request.
+    """Build an agent for one request, reusing a process-wide store + graph.
 
     ``top_k`` is built into the per-request ``RetrieverConfig`` rather
     than overlaid on a cached agent — clearer ownership and no shared
-    mutable state across concurrent calls.
+    mutable state across concurrent calls. The expensive bits — the
+    pgvector connection pool, the encoder, the call graph — are cached
+    on first use so subsequent requests don't re-run DDL or re-load
+    the graph from disk.
     """
     from codex_atlas.store import ChunkStore  # noqa: PLC0415
 
-    encoder = _encoder()
-    store = ChunkStore(dsn=_dsn())
-    await store.setup(dim=encoder.dim)
-    retriever = Retriever(encoder, store, _graph(), RetrieverConfig(top_k=top_k))
+    global _cached_store, _cached_encoder, _cached_graph  # noqa: PLW0603
+    if _cached_encoder is None:
+        _cached_encoder = _encoder()
+    if _cached_store is None:
+        store = ChunkStore(dsn=_dsn())
+        await store.setup(dim=_cached_encoder.dim)
+        _cached_store = store
+    if _cached_graph is None:
+        _cached_graph = _graph()
+    retriever = Retriever(
+        _cached_encoder,
+        _cached_store,  # type: ignore[arg-type]
+        _cached_graph,
+        RetrieverConfig(top_k=top_k),
+    )
     return Agent(retriever)
 
 

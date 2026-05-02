@@ -3,12 +3,15 @@
 One row per indexed chunk (function or method body): id + qualified_name +
 file_path + lineno_start + lineno_end + kind + text + vector.
 
-Lifecycle: `setup` creates the table + HNSW index; `upsert_chunks` is
-idempotent on (file_path, qualified_name, lineno_start); `search` runs a
-cosine top-k.
+Lifecycle: ``setup`` is a one-shot bootstrap that creates the table +
+HNSW index AND initialises a small ``asyncpg`` connection pool;
+``upsert_chunks`` is idempotent on (file_path, qualified_name,
+lineno_start); ``search`` runs a cosine top-k. Re-running ``setup`` is
+safe — the underlying DDL is ``IF NOT EXISTS`` and the pool is reused.
 
-Connection-per-call so the store works behind a process pool. For
-production use, swap in a `psycopg_pool` — the API stays the same.
+Pool sizing is intentionally tiny (min=1, max=5). The MCP server is
+single-process and the eval harness fires sequentially; a larger pool
+would just hold idle connections.
 """
 
 from __future__ import annotations
@@ -38,24 +41,52 @@ class StoredChunk:
 
 
 class ChunkStore:
-    """Async pgvector adapter for code chunks."""
+    """Async pgvector adapter for code chunks (pooled connections)."""
 
-    def __init__(self, dsn: str, table: str = "codex_atlas_chunks") -> None:
+    def __init__(
+        self,
+        dsn: str,
+        table: str = "codex_atlas_chunks",
+        *,
+        min_pool_size: int = 1,
+        max_pool_size: int = 5,
+    ) -> None:
         self._dsn = dsn
         self._table = table
         self._dim: int | None = None
+        self._min_pool_size = min_pool_size
+        self._max_pool_size = max_pool_size
+        self._pool: asyncpg.Pool | None = None
+        # Set once setup() has run successfully; lets repeat callers
+        # short-circuit the DDL without skipping pool initialisation.
+        self._bootstrapped: bool = False
 
     @asynccontextmanager
     async def _connect(self) -> AsyncIterator[asyncpg.Connection]:
-        conn = await asyncpg.connect(self._dsn)
-        try:
+        # Lazy-init the pool on first acquisition so callers that only
+        # ever pass through ``setup`` (e.g. tests using the InMemory
+        # variant) don't pay for a connect they never need.
+        if self._pool is None:
+            self._pool = await asyncpg.create_pool(
+                self._dsn,
+                min_size=self._min_pool_size,
+                max_size=self._max_pool_size,
+            )
+        async with self._pool.acquire() as conn:
             yield conn
-        finally:
-            await conn.close()
 
     async def setup(self, dim: int, drop_existing: bool = False) -> None:
+        """One-shot bootstrap: ensure schema + pool. Safe to skip after the first call.
+
+        Re-running is a no-op for the DDL (every statement is
+        ``IF NOT EXISTS``) but still cheap; chronic-path callers (MCP /
+        agent loop) should call this once at process start and reuse
+        the store across requests.
+        """
         if dim <= 0:
             raise ValueError("dim must be positive")
+        if self._bootstrapped and not drop_existing and self._dim == dim:
+            return
         self._dim = dim
         async with self._connect() as conn:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
@@ -84,6 +115,14 @@ class ChunkStore:
                 f'ON "{self._table}" USING hnsw (vec vector_cosine_ops) '
                 "WITH (m = 16, ef_construction = 64)"
             )
+        self._bootstrapped = True
+
+    async def close(self) -> None:
+        """Close the pool. Idempotent — safe to call multiple times."""
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
+            self._bootstrapped = False
 
     async def teardown(self) -> None:
         async with self._connect() as conn:

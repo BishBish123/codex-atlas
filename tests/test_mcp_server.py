@@ -79,6 +79,13 @@ class TestFindCallersTool:
         with pytest.raises(ValueError, match="depth"):
             await find_callers("m.b", depth=0)
 
+    async def test_clamps_oversized_depth(self, fixture_graph: Path) -> None:
+        # Mirror get_graph_neighborhood: requests above the cap clamp
+        # rather than fail. The response surfaces the clamped depth so
+        # callers can tell their request was reduced.
+        resp = await find_callers("m.b", depth=20)
+        assert resp.depth == MAX_NEIGHBORHOOD_DEPTH
+
 
 class TestGetGraphNeighborhoodTool:
     async def test_returns_neighborhood_response(self, fixture_graph: Path) -> None:

@@ -180,11 +180,27 @@ async def explain_function(qualified_name: str) -> SearchResponse:
 
 @mcp.tool
 async def find_callers(qualified_name: str, depth: int = 1) -> CallersResponse:
-    """Graph-only callers traversal — no LLM, just the call graph."""
+    """Graph-only callers traversal — no LLM, just the call graph.
+
+    Depth is clamped at ``MAX_NEIGHBORHOOD_DEPTH`` (8) at the MCP
+    boundary, matching ``get_graph_neighborhood``. Requests above the
+    cap are reduced rather than rejected so a slightly-too-large depth
+    doesn't fail the tool call.
+    """
     if not qualified_name.strip():
         raise ValueError("qualified_name must not be blank")
     if depth <= 0:
         raise ValueError("depth must be positive")
+    if depth > MAX_NEIGHBORHOOD_DEPTH:
+        _log.warning(
+            "find_callers.depth_clamped",
+            extra={
+                "qualified_name": qualified_name,
+                "requested_depth": depth,
+                "clamped_depth": MAX_NEIGHBORHOOD_DEPTH,
+            },
+        )
+        depth = MAX_NEIGHBORHOOD_DEPTH
     callers = _graph().find_callers(qualified_name, depth=depth)
     return CallersResponse(
         target=qualified_name,

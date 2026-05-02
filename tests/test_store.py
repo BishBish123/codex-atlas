@@ -11,9 +11,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import numpy as np
 import pytest
 
-from codex_atlas.store import ChunkStore
+from codex_atlas.indexer.ast_parser import Chunk, SymbolKind
+from codex_atlas.store import ChunkStore, InMemoryChunkStore
 
 
 class _FakeConnection:
@@ -85,3 +87,65 @@ class TestSetupIdempotence:
         # constraint ``dim > 0`` is for.
         with pytest.raises(ValueError, match="dim"):
             await store.setup(dim=0)
+
+
+def _chunk(qname: str, idx: int) -> Chunk:
+    return Chunk(
+        qualified_name=qname,
+        kind=SymbolKind.FUNCTION,
+        file_path=f"f{idx}.py",
+        lineno_start=1,
+        lineno_end=2,
+        text=f"def {qname.rsplit('.', 1)[-1]}(): pass",
+    )
+
+
+class TestInMemoryChunkStoreRoundTrip:
+    async def test_round_trip_100_chunks(self) -> None:
+        # The fundamental contract: write N chunks, search returns ranked
+        # StoredChunks, fetch_by_qualified_name finds them by qname.
+        store = InMemoryChunkStore()
+        await store.setup(dim=8)
+        rng = np.random.default_rng(seed=42)
+        n = 100
+        chunks = [_chunk(f"m.fn_{i}", i) for i in range(n)]
+        vectors = rng.standard_normal((n, 8)).astype(np.float32)
+        written = await store.upsert_chunks(chunks, vectors)
+        assert written == n
+        # Search using one of the actual stored vectors — that vector
+        # must rank itself first (cosine = 1.0 with self).
+        query = vectors[42]
+        results = await store.search(query, k=5)
+        assert results[0].qualified_name == "m.fn_42"
+        assert results[0].score == pytest.approx(1.0, rel=1e-4)
+        assert len(results) == 5
+        # fetch_by_qualified_name returns the row for known qnames.
+        row = await store.fetch_by_qualified_name("m.fn_7")
+        assert row is not None
+        assert row.qualified_name == "m.fn_7"
+        # And None for unknown.
+        assert (await store.fetch_by_qualified_name("m.ghost")) is None
+
+    async def test_setup_with_drop_existing_clears(self) -> None:
+        store = InMemoryChunkStore()
+        await store.setup(dim=4)
+        chunks = [_chunk("m.a", 0)]
+        vectors = np.zeros((1, 4), dtype=np.float32)
+        await store.upsert_chunks(chunks, vectors)
+        # Re-setup with drop_existing wipes prior content.
+        await store.setup(dim=4, drop_existing=True)
+        results = await store.search(vectors[0], k=1)
+        assert results == []
+
+    async def test_search_before_setup_errors(self) -> None:
+        store = InMemoryChunkStore()
+        with pytest.raises(RuntimeError, match="setup"):
+            await store.search(np.zeros(4, dtype=np.float32))
+
+    async def test_dim_mismatch_rejected(self) -> None:
+        store = InMemoryChunkStore()
+        await store.setup(dim=4)
+        chunks = [_chunk("m.a", 0)]
+        bad_vectors = np.zeros((1, 8), dtype=np.float32)
+        with pytest.raises(ValueError, match="dim"):
+            await store.upsert_chunks(chunks, bad_vectors)

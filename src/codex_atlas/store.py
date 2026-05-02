@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Protocol
 
 import asyncpg
 import numpy as np
@@ -38,6 +39,24 @@ class StoredChunk:
     kind: SymbolKind
     text: str
     score: float
+
+
+class ChunkStoreProtocol(Protocol):
+    """Methods the retriever needs from any chunk store backend.
+
+    The pgvector ``ChunkStore`` and the test-only ``InMemoryChunkStore``
+    both conform. New backends only need to implement this surface.
+    """
+
+    async def setup(self, dim: int, drop_existing: bool = False) -> None: ...
+
+    async def upsert_chunks(
+        self, chunks: Sequence[Chunk], vectors: np.ndarray, batch_size: int = 256
+    ) -> int: ...
+
+    async def search(self, query_vec: np.ndarray, k: int = 8) -> list[StoredChunk]: ...
+
+    async def fetch_by_qualified_name(self, qualified_name: str) -> StoredChunk | None: ...
 
 
 class ChunkStore:
@@ -234,3 +253,100 @@ class ChunkStore:
             text=row["text"],
             score=1.0,
         )
+
+
+class InMemoryChunkStore:
+    """Dict-backed chunk store for tests + the eval harness.
+
+    Same protocol surface as ``ChunkStore`` (see ``ChunkStoreProtocol``).
+    Cosine similarity is computed in NumPy on every search — fine for
+    the 12-question eval set + small fixture corpora; do NOT use for
+    > a few thousand chunks. The pgvector backend exists for that.
+    """
+
+    def __init__(self) -> None:
+        self._dim: int | None = None
+        # Keyed by chunk id; an OrderedDict-style insertion order is
+        # preserved by plain dict in 3.7+.
+        self._rows: dict[str, StoredChunk] = {}
+        self._vectors: dict[str, np.ndarray] = {}
+
+    async def setup(self, dim: int, drop_existing: bool = False) -> None:
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        if drop_existing:
+            self._rows.clear()
+            self._vectors.clear()
+        self._dim = dim
+
+    async def upsert_chunks(
+        self, chunks: Sequence[Chunk], vectors: np.ndarray, batch_size: int = 256
+    ) -> int:
+        if self._dim is None:
+            raise RuntimeError("upsert_chunks() called before setup()")
+        if len(chunks) != vectors.shape[0]:
+            raise ValueError(
+                f"chunk/vector length mismatch: {len(chunks)} vs {vectors.shape[0]}"
+            )
+        if vectors.shape[1] != self._dim:
+            raise ValueError(f"vector dim {vectors.shape[1]} != setup dim {self._dim}")
+        if vectors.dtype != np.float32:
+            vectors = vectors.astype(np.float32, copy=False)
+        for i, chunk in enumerate(chunks):
+            cid = chunk.chunk_id()
+            self._rows[cid] = StoredChunk(
+                chunk_id=cid,
+                qualified_name=chunk.qualified_name,
+                file_path=chunk.file_path,
+                lineno_start=chunk.lineno_start,
+                lineno_end=chunk.lineno_end,
+                kind=chunk.kind,
+                text=chunk.text,
+                score=1.0,
+            )
+            self._vectors[cid] = vectors[i].copy()
+        return len(chunks)
+
+    async def search(self, query_vec: np.ndarray, k: int = 8) -> list[StoredChunk]:
+        if self._dim is None:
+            raise RuntimeError("search() called before setup()")
+        if k <= 0:
+            raise ValueError("k must be positive")
+        if query_vec.ndim != 1 or query_vec.shape[0] != self._dim:
+            raise ValueError(
+                f"query_vec must be 1-D of dim {self._dim}, got {query_vec.shape!r}"
+            )
+        if not self._rows:
+            return []
+        # Cosine similarity = (a . b) / (|a| |b|). Compute against every
+        # stored vector — O(n) per query, fine for the in-memory backend.
+        q = query_vec.astype(np.float32, copy=False)
+        q_norm = float(np.linalg.norm(q)) or 1.0
+        results: list[tuple[float, StoredChunk]] = []
+        for cid, vec in self._vectors.items():
+            v_norm = float(np.linalg.norm(vec)) or 1.0
+            cos = float(np.dot(q, vec) / (q_norm * v_norm))
+            row = self._rows[cid]
+            results.append(
+                (
+                    cos,
+                    StoredChunk(
+                        chunk_id=row.chunk_id,
+                        qualified_name=row.qualified_name,
+                        file_path=row.file_path,
+                        lineno_start=row.lineno_start,
+                        lineno_end=row.lineno_end,
+                        kind=row.kind,
+                        text=row.text,
+                        score=cos,
+                    ),
+                )
+            )
+        results.sort(key=lambda t: t[0], reverse=True)
+        return [r[1] for r in results[:k]]
+
+    async def fetch_by_qualified_name(self, qualified_name: str) -> StoredChunk | None:
+        for row in self._rows.values():
+            if row.qualified_name == qualified_name:
+                return row
+        return None

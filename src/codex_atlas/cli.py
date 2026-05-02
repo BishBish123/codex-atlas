@@ -27,7 +27,7 @@ from codex_atlas.eval.harness import (
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.indexer.walker import parse_corpus
 from codex_atlas.retriever import Retriever, RetrieverConfig
-from codex_atlas.store import ChunkStore
+from codex_atlas.store import ChunkStore, ChunkStoreProtocol, InMemoryChunkStore
 
 app = typer.Typer(
     name="atlas",
@@ -336,14 +336,39 @@ def eval_cmd(
     tolerance: float = typer.Option(
         0.05, help="Fractional tolerance for the baseline regression gate."
     ),
+    store_backend: str = typer.Option(
+        "postgres",
+        "--store",
+        help="`postgres` (pgvector via POSTGRES_DSN) or `memory` (dict-backed, "
+        "rebuilds the index from the corpus on the fly — no DB required).",
+    ),
+    corpus: Path = typer.Option(
+        Path("src"),
+        "--corpus",
+        help="Source tree to index when --store=memory.",
+    ),
 ) -> None:
     """Run the golden test set and write a markdown + (optional) JSON report."""
 
     async def _run() -> None:
         encoder_obj = _resolve_encoder(encoder)
         cg = CallGraph.load(graph)
-        store = ChunkStore(dsn=_dsn())
-        await store.setup(dim=encoder_obj.dim)
+        store: ChunkStoreProtocol
+        if store_backend == "memory":
+            # Dict-backed: rebuild the embedding index from `corpus` so
+            # the harness stays hermetic. No DSN, no pgvector.
+            store = InMemoryChunkStore()
+            await store.setup(dim=encoder_obj.dim)
+            parsed = parse_corpus(corpus)
+            chunks = [c for pf in parsed for c in pf.chunks]
+            if chunks:
+                vectors = encoder_obj.encode([c.text for c in chunks])
+                await store.upsert_chunks(chunks, vectors)
+        elif store_backend == "postgres":
+            store = ChunkStore(dsn=_dsn())
+            await store.setup(dim=encoder_obj.dim)
+        else:
+            _bail(f"unknown --store value {store_backend!r} (expected: postgres, memory)")
         retriever = Retriever(encoder_obj, store, cg, RetrieverConfig(top_k=8))
         agent = Agent(retriever)
         questions = load_golden_set()

@@ -24,7 +24,7 @@ from enum import StrEnum
 
 from codex_atlas.embed import Encoder
 from codex_atlas.indexer.graph import CallGraph
-from codex_atlas.store import ChunkStore, StoredChunk
+from codex_atlas.store import ChunkStoreProtocol, StoredChunk
 
 
 class Route(StrEnum):
@@ -249,7 +249,7 @@ class Retriever:
     def __init__(
         self,
         encoder: Encoder,
-        store: ChunkStore,
+        store: ChunkStoreProtocol,
         graph: CallGraph,
         config: RetrieverConfig | None = None,
     ) -> None:

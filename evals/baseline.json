@@ -1,11 +1,11 @@
 {
-  "n": 12,
-  "route_correctness": 0.9166666666666666,
-  "citation_recall_mean": 0.16666666666666666,
-  "citation_precision_mean": 0.061111111111111116,
-  "latency_p50_ms": 0.3977157175540924,
-  "latency_p95_ms": 0.8779759518802166,
-  "latency_p99_ms": 0.8779759518802166,
-  "tool_call_count_mean": 2.0,
-  "cost_estimate_usd_total": 0.19821599999999998
+  "citation_precision_mean": 0.06429924242424243,
+  "citation_recall_mean": 0.21875,
+  "cost_estimate_usd_total": 0.274953,
+  "latency_p50_ms": 1.9791095983237028,
+  "latency_p95_ms": 3.122697351500392,
+  "latency_p99_ms": 3.1476916279643774,
+  "n": 16,
+  "route_correctness": 0.9375,
+  "tool_call_count_mean": 2.0
 }

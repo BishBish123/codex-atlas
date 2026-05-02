@@ -116,6 +116,46 @@ _DEFAULT_GOLDEN = [
             "codex_atlas.indexer.graph",
         ],
     ),
+    # ------------------------------ neighborhood ------------------------------
+    EvalQuestion(
+        qid="neighborhood-1",
+        category="neighborhood",
+        question="neighborhood of codex_atlas.indexer.graph.CallGraph.find_callers",
+        expected_route=ExpectedRoute.NEIGHBORHOOD,
+        gold_qualified_names=[
+            "codex_atlas.indexer.graph.CallGraph.find_callers",
+            "codex_atlas.indexer.graph.CallGraph.neighbors",
+        ],
+    ),
+    EvalQuestion(
+        qid="neighborhood-2",
+        category="neighborhood",
+        question="everything around codex_atlas.retriever.Retriever.retrieve",
+        expected_route=ExpectedRoute.NEIGHBORHOOD,
+        gold_qualified_names=[
+            "codex_atlas.retriever.Retriever.retrieve",
+        ],
+    ),
+    # ------------------------------ import_chain ------------------------------
+    EvalQuestion(
+        qid="import-chain-1",
+        category="import-chain",
+        question="which modules import codex_atlas.store",
+        expected_route=ExpectedRoute.IMPORT_CHAIN,
+        gold_qualified_names=[
+            "codex_atlas.retriever",
+            "codex_atlas.cli",
+        ],
+    ),
+    EvalQuestion(
+        qid="import-chain-2",
+        category="import-chain",
+        question="import chain for codex_atlas.indexer.graph",
+        expected_route=ExpectedRoute.IMPORT_CHAIN,
+        gold_qualified_names=[
+            "codex_atlas.retriever",
+        ],
+    ),
     # ------------------------------ failure-likely ------------------------------
     EvalQuestion(
         qid="refusal-1",

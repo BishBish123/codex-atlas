@@ -65,6 +65,14 @@ tail is visible.
 (usually the rewrite loop maxing out). That's expected; if every
 question hits `max_attempts`, the grader is too strict.
 
+**Percentile method.** We use `numpy.percentile` with default linear
+interpolation for samples of `n >= 10`. For small samples (`n < 10`)
+linear interpolation is misleading — the values bounce on every added
+question. In that regime `p95` and `p99` are reported as the sample
+*max*: a conservative upper bound that doesn't pretend to more
+precision than the data supports. `p50` is always the linear-
+interpolation median.
+
 ### `tool_call_count` (mean)
 
 Average number of retriever invocations per question. Each retry

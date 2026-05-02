@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+import numpy as np
+
 from codex_atlas.agent import Agent, AgentResult
 from codex_atlas.retriever import Route
 
@@ -40,6 +42,8 @@ class ExpectedRoute(StrEnum):
     STRUCTURAL = "structural"
     HYBRID = "hybrid"
     SUMMARIZATION = "summarization"
+    NEIGHBORHOOD = "neighborhood"
+    IMPORT_CHAIN = "import_chain"
 
 
 @dataclass(frozen=True)
@@ -103,6 +107,7 @@ def score_result(
     *,
     price_input: float = DEFAULT_PRICE_USD_PER_1K_INPUT,
     price_output: float = DEFAULT_PRICE_USD_PER_1K_OUTPUT,
+    indexed_qnames: frozenset[str] | None = None,
 ) -> EvalResult:
     cited = [c.qualified_name for c in agent_result.citations]
 
@@ -134,6 +139,7 @@ def score_result(
         precision=precision,
         route_correct=route_correct,
         answer=agent_result.answer,
+        indexed_qnames=indexed_qnames,
     )
     cost = _estimate_cost_usd(
         question=question.question,
@@ -170,6 +176,7 @@ def _classify_failure(  # noqa: PLR0911
     precision: float,
     route_correct: bool,
     answer: str,
+    indexed_qnames: frozenset[str] | None = None,
 ) -> FailureBucket:
     """Bucket a question into the 7-mode failure taxonomy.
 
@@ -177,12 +184,29 @@ def _classify_failure(  # noqa: PLR0911
     failure is never double-counted. ``OUTDATED_INDEX`` is detected
     heuristically from the agent's answer text — production swaps this
     for a real freshness signal (commit-sha drift on the chunks).
+
+    ``indexed_qnames`` is the set of qualified names actually present in
+    the index. When provided, gold qnames that aren't in the index are
+    classified as ``MISSING_NODE`` — distinguishing "harness expected a
+    symbol that doesn't exist in this corpus" from "agent missed it".
     """
     # Refusal questions: gold is empty, so recall=1.0 means correct refusal.
     if not question.gold_qualified_names:
         if cited:
             return FailureBucket.OFF_TOPIC
         return FailureBucket.NONE
+
+    # MISSING_NODE — every gold qname is absent from the index. This is a
+    # corpus-mismatch signal for the harness, not an agent failure. We
+    # only flag when ALL gold names are missing AND the agent surfaced
+    # nothing matching, otherwise it's covered by the recall/precision
+    # buckets below.
+    if (
+        indexed_qnames is not None
+        and not cited
+        and all(g not in indexed_qnames for g in question.gold_qualified_names)
+    ):
+        return FailureBucket.MISSING_NODE
 
     if "stale" in answer.lower() or "outdated" in answer.lower():
         return FailureBucket.OUTDATED_INDEX
@@ -233,13 +257,25 @@ def _matches(gold: str, cited: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def run_eval(agent: Agent, questions: list[EvalQuestion]) -> list[EvalResult]:
+async def run_eval(
+    agent: Agent,
+    questions: list[EvalQuestion],
+    *,
+    indexed_qnames: frozenset[str] | None = None,
+) -> list[EvalResult]:
+    """Run every question through the agent and score the results.
+
+    ``indexed_qnames`` is the optional set of qnames in the corpus
+    index. When provided, scoring distinguishes ``MISSING_NODE``
+    (gold qname doesn't exist in the index) from ``UNGROUNDED`` (agent
+    failed to surface an existing qname).
+    """
     out: list[EvalResult] = []
     for q in questions:
         t0 = time.perf_counter()
         result = await agent.run(q.question)
         latency = (time.perf_counter() - t0) * 1000.0
-        out.append(score_result(q, result, latency))
+        out.append(score_result(q, result, latency, indexed_qnames=indexed_qnames))
     return out
 
 
@@ -249,19 +285,35 @@ def aggregate(results: list[EvalResult]) -> dict[str, float | int]:
     Convenient for ``evaluate_against_baseline`` and for tests that
     don't want to parse the report. Numbers track ``render_report``
     output exactly.
+
+    Percentile method: ``numpy.percentile`` with the default
+    ``linear`` interpolation. For very small samples (n < 10) the
+    naive index-based picks the original code used produced misleading
+    "p99 = max" or "p95 = p50" depending on rounding; we explicitly
+    fall back to the sample max for p95/p99 in that regime so the
+    metric is stable + interpretable. See ``evals/INTERPRETATION.md``.
     """
     if not results:
         return {}
     n = len(results)
-    latencies = sorted(r.latency_ms for r in results)
+    latencies_arr = np.asarray([r.latency_ms for r in results], dtype=float)
+    if n < 10:
+        # Tiny samples: percentile interpolation is misleading. Report
+        # the worst observed value as a conservative upper bound.
+        p95 = float(latencies_arr.max())
+        p99 = float(latencies_arr.max())
+    else:
+        p95 = float(np.percentile(latencies_arr, 95))
+        p99 = float(np.percentile(latencies_arr, 99))
+    p50 = float(np.percentile(latencies_arr, 50))
     return {
         "n": n,
         "route_correctness": sum(1 for r in results if r.route_correct) / n,
         "citation_recall_mean": sum(r.citation_recall for r in results) / n,
         "citation_precision_mean": sum(r.citation_precision for r in results) / n,
-        "latency_p50_ms": latencies[n // 2],
-        "latency_p95_ms": latencies[max(0, int(n * 0.95) - 1)],
-        "latency_p99_ms": latencies[max(0, int(n * 0.99) - 1)],
+        "latency_p50_ms": p50,
+        "latency_p95_ms": p95,
+        "latency_p99_ms": p99,
         "tool_call_count_mean": sum(r.tool_call_count for r in results) / n,
         "cost_estimate_usd_total": sum(r.cost_estimate_usd for r in results),
     }

@@ -258,3 +258,72 @@ def test_token_count_floor(answer: str, n_tokens: int) -> None:
     res = score_result(q, ar, latency_ms=10.0)
     # Empty answer floors at 1 token, so cost is non-zero.
     assert res.cost_estimate_usd > 0
+
+
+class TestExpectedRouteCoverage:
+    def test_expected_route_covers_all_six(self) -> None:
+        # Every Route value in the retriever must have a matching
+        # ExpectedRoute, otherwise the harness can't model that route's
+        # questions.
+        expected_values = {str(e) for e in ExpectedRoute}
+        route_values = {str(r) for r in Route}
+        missing = route_values - expected_values
+        assert not missing, f"ExpectedRoute is missing routes: {missing}"
+
+
+class TestMissingNodeBucket:
+    def test_missing_node_when_qname_absent(self) -> None:
+        # Gold qname doesn't exist in the index; agent surfaced nothing.
+        # The bucket should be MISSING_NODE — distinguishes "harness
+        # asked for a non-existent symbol" from "agent failed to find one".
+        q = _q(gold=["m.does_not_exist"])
+        ar = _agent_result(citations=[], route=Route.LOOKUP)
+        indexed: frozenset[str] = frozenset({"m.foo", "m.bar"})
+        res = score_result(q, ar, latency_ms=10.0, indexed_qnames=indexed)
+        assert res.failure_bucket is FailureBucket.MISSING_NODE
+
+    def test_missing_node_not_triggered_when_qname_present(self) -> None:
+        # Gold IS in the index but agent returned nothing -> UNGROUNDED,
+        # not MISSING_NODE.
+        q = _q(gold=["m.foo"])
+        ar = _agent_result(citations=[], route=Route.LOOKUP)
+        indexed: frozenset[str] = frozenset({"m.foo"})
+        res = score_result(q, ar, latency_ms=10.0, indexed_qnames=indexed)
+        assert res.failure_bucket is FailureBucket.UNGROUNDED
+
+    def test_missing_node_skipped_without_indexed_qnames(self) -> None:
+        # Backward-compat: omit indexed_qnames -> no MISSING_NODE bucket
+        # detection; falls through to the legacy taxonomy.
+        q = _q(gold=["m.does_not_exist"])
+        ar = _agent_result(citations=[], route=Route.LOOKUP)
+        res = score_result(q, ar, latency_ms=10.0)
+        # Without an index the harness can't tell — UNGROUNDED is the
+        # legacy fallback.
+        assert res.failure_bucket is FailureBucket.UNGROUNDED
+
+
+class TestPercentileMethod:
+    def test_p95_uses_numpy_percentile_for_large_n(self) -> None:
+        # n >= 10 -> numpy.percentile linear interpolation. For 100 evenly
+        # spaced latencies 1..100 ms, p95 should be ~95.05 (linear-interp).
+        import numpy as np  # noqa: PLC0415
+
+        q = _q(gold=["m.foo"])
+        results = [
+            score_result(q, _agent_result(citations=[_cite("m.foo")]), latency_ms=float(i))
+            for i in range(1, 101)
+        ]
+        agg = aggregate(results)
+        expected_p95 = float(np.percentile([float(i) for i in range(1, 101)], 95))
+        assert agg["latency_p95_ms"] == pytest.approx(expected_p95)
+
+    def test_p95_falls_back_to_max_for_small_n(self) -> None:
+        q = _q(gold=["m.foo"])
+        results = [
+            score_result(q, _agent_result(citations=[_cite("m.foo")]), latency_ms=lat)
+            for lat in (1.0, 2.0, 3.0, 4.0, 5.0)
+        ]
+        agg = aggregate(results)
+        # n=5 < 10 -> p95/p99 = max
+        assert agg["latency_p95_ms"] == 5.0
+        assert agg["latency_p99_ms"] == 5.0

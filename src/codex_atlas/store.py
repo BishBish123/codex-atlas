@@ -16,6 +16,7 @@ would just hold idle connections.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -25,6 +26,13 @@ import asyncpg
 import numpy as np
 
 from codex_atlas.indexer.ast_parser import Chunk, SymbolKind
+
+# Postgres unquoted identifier rule, conservatively narrowed: a leading
+# letter or underscore, then up to 62 letters / digits / underscores
+# (Postgres caps identifiers at NAMEDATALEN-1 = 63 chars). The pattern
+# matches the pg lexer's NAMEDATALEN-1 rule and rejects everything that
+# isn't a plain SQL name — quotes, semicolons, whitespace, dots.
+_TABLE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
 
 @dataclass(frozen=True)
@@ -70,6 +78,15 @@ class ChunkStore:
         min_pool_size: int = 1,
         max_pool_size: int = 5,
     ) -> None:
+        # Validate the ``table`` argument up-front so the f-string
+        # interpolation downstream is bounded to a known-safe SQL
+        # identifier shape. Without this the ``ruff S608`` suppression
+        # at the use sites would be load-bearing on caller discipline.
+        if not _TABLE_IDENT_RE.match(table):
+            raise ValueError(
+                f"invalid table identifier {table!r}; must match "
+                f"{_TABLE_IDENT_RE.pattern}"
+            )
         self._dsn = dsn
         self._table = table
         self._dim: int | None = None

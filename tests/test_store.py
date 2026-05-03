@@ -34,6 +34,34 @@ async def _stub_connect(conn: _FakeConnection) -> AsyncIterator[_FakeConnection]
     yield conn
 
 
+class TestTableIdentifierValidation:
+    """``table`` is interpolated into DDL/DML f-strings — validate it."""
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "; DROP TABLE foo; --",
+            "foo; DROP TABLE bar",
+            "foo bar",
+            'foo"bar',
+            "1foo",  # leading digit not allowed
+            "foo.bar",  # dot
+            "",
+            "a" * 64,  # exceeds NAMEDATALEN-1
+        ],
+    )
+    def test_rejects_invalid_table_name(self, bad: str) -> None:
+        with pytest.raises(ValueError, match="invalid table identifier"):
+            ChunkStore(dsn="postgresql://stub", table=bad)
+
+    def test_accepts_default_table(self) -> None:
+        # Default name and any plain SQL identifier should pass.
+        ChunkStore(dsn="postgresql://stub")
+        ChunkStore(dsn="postgresql://stub", table="my_table")
+        ChunkStore(dsn="postgresql://stub", table="_underscored")
+        ChunkStore(dsn="postgresql://stub", table="MixedCase123")
+
+
 class TestSetupIdempotence:
     async def test_setup_twice_short_circuits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The second ``setup`` call with the same dim must NOT re-issue

@@ -6,7 +6,7 @@
 [![python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](pyproject.toml)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![mcp](https://img.shields.io/badge/mcp-spec--conformant-success)]()
-[![eval](https://img.shields.io/badge/route%20accuracy-91%25-brightgreen)](evals/REPORT.md)
+[![eval](https://img.shields.io/badge/route%20accuracy-93.8%25-brightgreen)](evals/REPORT.md)
 
 ---
 
@@ -77,12 +77,21 @@ The whole thing is wrapped as a FastMCP server with 7 tools + 1 resource:
 git clone https://github.com/BishBish123/codex-atlas.git
 cd codex-atlas
 make install          # uv sync (+ embed extra on supported platforms)
+# Intel macOS: use `make install-min` (sentence-transformers wheels are arm64-only).
 
 # No Docker, no DB — index into a JSON snapshot at data/chunks.json.
 uv run atlas index src/ --store=memory
 
 # Ask a question (reads data/chunks.json + data/graph.json).
 uv run atlas ask "who calls find_callers" --store=memory
+
+# Other subcommands worth knowing:
+uv run atlas search "who calls _traverse" --store=memory          # raw retrieval, no synthesis
+uv run atlas explain "codex_atlas.retriever.Retriever.retrieve"   # symbol + immediate neighbours
+
+# Point it at any other Python repo (absolute path):
+uv run atlas index /Users/me/my-project --store=memory
+# The MCP config below picks up data/{graph,chunks}.json from wherever you ran `atlas index`.
 
 # Run the golden test set.
 uv run atlas eval --json-out evals/scores.json
@@ -121,7 +130,9 @@ POSTGRES_DSN=$POSTGRES_DSN ATLAS_STORE=postgres ATLAS_GRAPH_PATH=data/graph.json
     uv run atlas-mcp
 ```
 
-Then in your MCP client config:
+Then in your MCP client config. **Use absolute paths** — Claude Desktop / Code launches MCP
+servers with an unpredictable cwd, so relative paths like `data/graph.json` break every tool
+call with `FileNotFoundError`:
 
 ```json
 {
@@ -131,7 +142,8 @@ Then in your MCP client config:
       "args": ["run", "atlas-mcp"],
       "env": {
         "ATLAS_STORE": "memory",
-        "ATLAS_GRAPH_PATH": "data/graph.json"
+        "ATLAS_GRAPH_PATH": "<absolute-path-to-codex-atlas>/data/graph.json",
+        "ATLAS_CHUNKS_PATH": "<absolute-path-to-codex-atlas>/data/chunks.json"
       }
     }
   }
@@ -144,9 +156,21 @@ For the Postgres backend, swap the env block:
 "env": {
   "ATLAS_STORE": "postgres",
   "POSTGRES_DSN": "postgresql://bench:bench@localhost:5433/bench",
-  "ATLAS_GRAPH_PATH": "data/graph.json"
+  "ATLAS_GRAPH_PATH": "<absolute-path-to-codex-atlas>/data/graph.json"
 }
 ```
+
+### Environment variables
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ATLAS_STORE` | `memory` | Chunk-store backend: `memory` (reads `ATLAS_CHUNKS_PATH`) or `postgres` (uses `POSTGRES_DSN`). |
+| `ATLAS_GRAPH_PATH` | `data/graph.json` | Persisted call graph the server loads at startup. Use an absolute path under MCP. |
+| `ATLAS_CHUNKS_PATH` | `data/chunks.json` | Chunk snapshot read when `ATLAS_STORE=memory`. Use an absolute path under MCP. |
+| `ATLAS_ENCODER` | `fake` | Encoder name. `fake` = deterministic blake2b (no model download). Any other value loads a `sentence-transformers` model (e.g. `BAAI/bge-small-en-v1.5`). |
+| `ATLAS_STEP_TIMEOUT_S` | `10` | Per-step (retriever / synthesiser) timeout in seconds. `0` disables. |
+| `ATLAS_RUN_TIMEOUT_S` | `30` | Whole-run timeout in seconds. `0` disables. |
+| `POSTGRES_DSN` | _required for postgres_ | DSN for the pgvector backend. |
 
 ## Eval results
 
@@ -155,8 +179,9 @@ The 16-question golden set runs `atlas eval` against this repo's own `src/` (a h
 | Metric | Value |
 | --- | ---: |
 | Route correctness | 93.8% |
+| Citation recall (mean, overall) | 0.22 |
 | Citation recall (mean, structural) | 0.67 |
-| p50 latency (ms) | <10 |
+| p50 latency (ms) | 7.3 |
 
 The lookup / hybrid / summarization recall is intentionally measured with `FakeEncoder` (deterministic blake2b — no model download required). With a real `BAAI/bge-small-en-v1.5` encoder, those numbers jump significantly. The harness is wired to take any `Encoder` Protocol implementation, so swapping is one line.
 

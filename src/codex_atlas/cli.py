@@ -506,7 +506,7 @@ def mcp(
         help="Path to the chunk snapshot when --store=memory.",
     ),
 ) -> None:
-    """Start the Codex-Atlas MCP server (alias for `atlas-mcp run`)."""
+    """Start the Codex-Atlas MCP server."""
     # Forward store choice to the MCP server via env. The server reads
     # ``ATLAS_STORE`` and ``ATLAS_CHUNKS_PATH`` at first-tool-call time.
     if store_backend not in {"memory", "postgres"}:
@@ -518,10 +518,9 @@ def mcp(
     from codex_atlas.mcp_server import validate_startup_config  # noqa: PLC0415
 
     with _command_wrapper():
-        # Fail-fast: same check ``atlas-mcp run`` does, surfaced through
-        # the wrapper command too. Map a config error to exit 2 instead
-        # of letting the wrapper turn it into the generic "internal
-        # error" exit 1.
+        # Fail-fast on bad startup config and map the error to exit 2,
+        # instead of letting the wrapper turn it into the generic
+        # "internal error" exit 1.
         try:
             validate_startup_config()
         except RuntimeError as e:

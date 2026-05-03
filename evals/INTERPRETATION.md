@@ -18,7 +18,7 @@ set expects.
 | < 85% | the heuristic classifier is not enough; promote to LLM |
 
 A single missed route is not a bug — the gold set is intentionally
-small (12 questions) so noise is real. Watch the trend across runs,
+small (16 questions) so noise is real. Watch the trend across runs,
 not the absolute number.
 
 ### `citation_recall` (mean)

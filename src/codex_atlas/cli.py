@@ -7,6 +7,8 @@ import json
 import os
 import sys
 import traceback
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NoReturn
 
@@ -69,6 +71,30 @@ def _bail(message: str, exc: Exception | None = None, exit_code: int = 2) -> NoR
         # SystemExit. Wrapping with chaining preserves the message.
         raise exc
     raise typer.Exit(code=exit_code)
+
+
+@contextmanager
+def _command_wrapper() -> Iterator[None]:
+    """Catch unhandled exceptions inside any CLI command body.
+
+    Without this every command had its own scattered ``try/except`` and
+    ``--debug`` only fired for the two early-exit paths in ``_bail``
+    (missing DSN + missing baseline). Wrapping every command body
+    surfaces tracebacks in ``--debug`` mode and falls back to a clean
+    "internal error" message + exit 1 in normal mode for any other
+    failure. ``typer.Exit`` and ``typer.BadParameter`` pass through —
+    those are intentional, structured exits.
+    """
+    try:
+        yield
+    except (typer.Exit, typer.BadParameter):
+        raise
+    except Exception as e:
+        if _DEBUG:
+            console.print(traceback.format_exc())
+            raise
+        console.print(f"[red bold]internal error[/] {e}")
+        raise typer.Exit(code=1) from e
 
 
 def _resolve_encoder(name: str) -> Encoder:
@@ -174,7 +200,8 @@ def index(
         if output_format == "rich":
             console.print(f"[green]upserted[/] {n_written} chunks into pgvector")
 
-    asyncio.run(_run())
+    with _command_wrapper():
+        asyncio.run(_run())
 
 
 @app.command()
@@ -207,7 +234,8 @@ def ask(
                 t.add_row(c.qualified_name, c.file_path, f"{c.lineno_start}-{c.lineno_end}")
             console.print(t)
 
-    asyncio.run(_run())
+    with _command_wrapper():
+        asyncio.run(_run())
 
 
 @app.command()
@@ -273,7 +301,8 @@ def search(
             )
         console.print(t)
 
-    asyncio.run(_run())
+    with _command_wrapper():
+        asyncio.run(_run())
 
 
 @app.command()
@@ -297,7 +326,8 @@ def explain(
         )
         console.print(Markdown(result.answer))
 
-    asyncio.run(_run())
+    with _command_wrapper():
+        asyncio.run(_run())
 
 
 @app.command()
@@ -309,12 +339,13 @@ def mcp(
     """Start the Codex-Atlas MCP server (alias for `atlas-mcp run`)."""
     from codex_atlas.mcp_server import mcp as mcp_app  # noqa: PLC0415
 
-    if transport == "stdio":
-        asyncio.run(mcp_app.run_stdio_async())
-    elif transport == "http":
-        asyncio.run(mcp_app.run_http_async(host=host, port=port))
-    else:
-        raise typer.BadParameter(f"unknown transport {transport!r}")
+    with _command_wrapper():
+        if transport == "stdio":
+            asyncio.run(mcp_app.run_stdio_async())
+        elif transport == "http":
+            asyncio.run(mcp_app.run_http_async(host=host, port=port))
+        else:
+            raise typer.BadParameter(f"unknown transport {transport!r}")
 
 
 @app.command(name="eval")
@@ -421,4 +452,5 @@ def eval_cmd(
         # Print headline so the CLI invocation surfaces the numbers.
         console.print(report.split("## By category")[0])
 
-    asyncio.run(_run())
+    with _command_wrapper():
+        asyncio.run(_run())

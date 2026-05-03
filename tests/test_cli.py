@@ -192,3 +192,55 @@ class TestExitCodes:
         # BadParameter handling already produces exit 2 — pin that here.
         result = runner.invoke(app, ["mcp", "--transport", "totally-bogus"])
         assert result.exit_code == 2
+
+
+class TestCommandWrapper:
+    """Unhandled exceptions surface as exit 1 normally; in --debug, propagate."""
+
+    def _trigger_index_failure(
+        self,
+        monkeypatch,  # type: ignore[no-untyped-def]
+        tmp_path: Path,
+        *,
+        debug: bool,
+    ) -> object:
+        # Inject a broken ``parse_corpus`` so the index command fails
+        # while still going through the wrapper. Any unhandled exception
+        # path would do — this is the most direct.
+        def boom(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("synthetic failure for wrapper test")
+
+        monkeypatch.setattr(cli_mod, "parse_corpus", boom)
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        graph_out = tmp_path / "graph.json"
+        argv = [
+            "index",
+            str(corpus),
+            "--graph-out",
+            str(graph_out),
+            "--skip-embed",
+        ]
+        if debug:
+            argv = ["--debug", *argv]
+        return runner.invoke(app, argv)
+
+    def test_internal_error_exits_1(
+        self, monkeypatch, tmp_path: Path  # type: ignore[no-untyped-def]
+    ) -> None:
+        result = self._trigger_index_failure(monkeypatch, tmp_path, debug=False)
+        # Without --debug: clean exit 1 + friendly "internal error" message.
+        assert result.exit_code == 1
+        # The synthetic message is visible OR the wrapper's prefix.
+        out = (result.stdout or "") + (result.stderr or "")
+        assert "internal error" in out.lower() or "synthetic" in out.lower()
+
+    def test_internal_error_in_debug_propagates(
+        self, monkeypatch, tmp_path: Path  # type: ignore[no-untyped-def]
+    ) -> None:
+        result = self._trigger_index_failure(monkeypatch, tmp_path, debug=True)
+        # With --debug: the wrapper re-raises; CliRunner surfaces the
+        # original exception via ``result.exception``.
+        assert result.exception is not None
+        assert isinstance(result.exception, RuntimeError)
+        assert "synthetic" in str(result.exception)

@@ -70,6 +70,12 @@ class SearchResponse(BaseModel):
     attempts: int
     answer: str
     citations: list[CodeSearchHit]
+    # ``cancelled`` is the agent's ``CancelReason`` rendered as a string
+    # (currently one of "timeout" or "external"), or ``None`` when the
+    # run completed normally. Surfacing this at the MCP boundary lets
+    # clients distinguish a cancelled run (empty answer + cancelled set)
+    # from a normal "no results" answer (empty answer + cancelled None).
+    cancelled: str | None = None
 
 
 class CallerEntry(BaseModel):
@@ -173,6 +179,7 @@ def _to_response(result: AgentResult) -> SearchResponse:
         attempts=result.attempts,
         answer=result.answer,
         citations=hits,
+        cancelled=str(result.cancelled) if result.cancelled is not None else None,
     )
 
 

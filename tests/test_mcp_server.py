@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from codex_atlas import mcp_server
-from codex_atlas.agent import AgentResult
+from codex_atlas.agent import AgentResult, CancelReason
 from codex_atlas.indexer.ast_parser import ParsedFile, Symbol, SymbolKind
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.mcp_server import (
@@ -220,6 +220,46 @@ class TestSearchCodebaseRouteOverride:
     async def test_unknown_route_rejected(self) -> None:
         with pytest.raises(ValueError, match="unknown route"):
             await search_codebase("anything", route="not_a_route")
+
+
+class TestCancelledSurface:
+    async def test_cancelled_run_surfaces_in_mcp_response(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # When the agent reports a cancelled run, the MCP response must
+        # carry the cancel reason as a string so clients can distinguish
+        # "no results" from "the run was killed by the deadline".
+
+        async def fake_agent(top_k: int = 8) -> _StubAgent:
+            agent = _StubAgent()
+            # Replace ``run`` to return a cancelled result.
+            async def _run(query: str, *, route_override: Route | None = None) -> AgentResult:
+                return AgentResult(
+                    query=query,
+                    final_query=query,
+                    answer="",
+                    citations=[],
+                    route=Route.LOOKUP,
+                    grade=0.0,
+                    attempts=1,
+                    trace=[],
+                    cancelled=CancelReason.TIMEOUT,
+                )
+
+            agent.run = _run  # type: ignore[method-assign]
+            return agent
+
+        monkeypatch.setattr(mcp_server, "_agent", fake_agent)
+        resp = await search_code("anything")
+        assert resp.cancelled == "timeout"
+        assert resp.answer == ""
+
+    async def test_completed_run_has_null_cancelled(
+        self, stub_agent_factory: dict[str, object]
+    ) -> None:
+        # Sanity check: a normal run leaves ``cancelled`` as None.
+        resp = await search_code("anything")
+        assert resp.cancelled is None
 
 
 class TestModelShapes:

@@ -127,7 +127,12 @@ class TestFailureBuckets:
         res = score_result(q, ar, latency_ms=10.0)
         assert res.failure_bucket is FailureBucket.PARTIAL
 
-    def test_outdated_index_bucket(self) -> None:
+    def test_outdated_index_not_inferred_from_answer_text(self) -> None:
+        # Reserved bucket: the old heuristic flipped on the words "stale"
+        # / "outdated" appearing in the answer text — non-deterministic
+        # under paraphrase. Removed pending a structured freshness
+        # signal from the retriever. An answer that uses the word
+        # "stale" must NOT bucket as OUTDATED_INDEX.
         q = _q(gold=["m.foo"])
         ar = _agent_result(
             answer="this answer relies on stale index data",
@@ -135,7 +140,10 @@ class TestFailureBuckets:
             route=Route.LOOKUP,
         )
         res = score_result(q, ar, latency_ms=10.0)
-        assert res.failure_bucket is FailureBucket.OUTDATED_INDEX
+        assert res.failure_bucket is not FailureBucket.OUTDATED_INDEX
+        # With gold cited at recall=1.0 / precision=1.0 / correct route,
+        # the answer is fully grounded -> NONE.
+        assert res.failure_bucket is FailureBucket.NONE
 
     def test_refusal_correct_bucket_none(self) -> None:
         # No gold, no citations -> a correct refusal.

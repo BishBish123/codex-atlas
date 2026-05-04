@@ -65,7 +65,14 @@ class FailureBucket(StrEnum):
     PARTIAL = "partial"  # some gold cited, some missed
     UNGROUNDED = "ungrounded"  # answer cites nothing
     OFF_TOPIC = "off_topic"  # citations match no gold name
-    OUTDATED_INDEX = "outdated_index"  # answer references stale state
+    # ``OUTDATED_INDEX`` is reserved for future structured detection
+    # (e.g. the retriever surfacing an explicit ``freshness_warning``
+    # signal when the index is older than the corpus). It is currently
+    # unreachable: the previous answer-text heuristic ("answer contains
+    # the word 'stale' or 'outdated'") was non-deterministic — paraphrase
+    # changed the bucket. The bucket name is kept so downstream consumers
+    # of the JSON dump don't break when the structured signal lands.
+    OUTDATED_INDEX = "outdated_index"  # reserved; see harness docstring
 
 
 # Token / pricing approximation for `cost_estimate_usd`. The numbers are
@@ -181,15 +188,26 @@ def _classify_failure(  # noqa: PLR0911
     """Bucket a question into the 7-mode failure taxonomy.
 
     Order matters: we report the first bucket that matches so a single
-    failure is never double-counted. ``OUTDATED_INDEX`` is detected
-    heuristically from the agent's answer text — production swaps this
-    for a real freshness signal (commit-sha drift on the chunks).
+    failure is never double-counted.
+
+    ``OUTDATED_INDEX`` is intentionally unreachable here: the previous
+    "answer contains 'stale' or 'outdated'" heuristic was paraphrase-
+    sensitive (an LLM rewording the same finding bucketed differently),
+    so it has been removed. The bucket value remains in the enum and
+    will be repopulated once the retriever exposes a structured
+    ``freshness_warning`` signal — at which point this classifier will
+    consult that flag rather than the answer text.
 
     ``indexed_qnames`` is the set of qualified names actually present in
     the index. When provided, gold qnames that aren't in the index are
     classified as ``MISSING_NODE`` — distinguishing "harness expected a
     symbol that doesn't exist in this corpus" from "agent missed it".
     """
+    # ``answer`` is unused now that the OUTDATED_INDEX heuristic is gone,
+    # but the parameter is preserved for the future structured signal
+    # (the harness will pass the retriever's freshness flag here).
+    del answer
+
     # Refusal questions: gold is empty, so recall=1.0 means correct refusal.
     if not question.gold_qualified_names:
         if cited:
@@ -208,8 +226,6 @@ def _classify_failure(  # noqa: PLR0911
     ):
         return FailureBucket.MISSING_NODE
 
-    if "stale" in answer.lower() or "outdated" in answer.lower():
-        return FailureBucket.OUTDATED_INDEX
     if not route_correct:
         return FailureBucket.WRONG_ROUTE
     if not cited:

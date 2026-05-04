@@ -107,6 +107,23 @@ class ToolCall:
 
 
 @dataclass(frozen=True)
+class ClaimSpan:
+    """A claim's location inside the answer string.
+
+    Validators that scan the answer can return ``ClaimSpan`` entries so
+    the agent's redactor knows the exact byte range of each match. This
+    avoids ``str.replace`` collisions when the same backticked claim
+    appears twice — only the ungrounded occurrences are rewritten,
+    grounded ones survive verbatim.
+    """
+
+    claim: str
+    start: int  # offset of the opening backtick
+    end: int  # offset just past the closing backtick (exclusive)
+    grounded: bool
+
+
+@dataclass(frozen=True)
 class ValidationReport:
     """Per-claim grounded-vs-ungrounded breakdown.
 
@@ -114,6 +131,12 @@ class ValidationReport:
     name and that name appears in the retrieved chunks. Anything else
     (free-form prose, hand-waving) is conservatively counted as
     ungrounded — false negatives there cost less than false positives.
+
+    ``spans`` is the per-occurrence record (one entry per backtick-wrapped
+    qualified name in the answer). The agent's redactor uses these
+    offsets to rewrite ungrounded matches in place; ``ungrounded_claims``
+    and ``grounded_qualified_names`` keep the de-duplicated names that
+    callers actually want to display.
     """
 
     n_claims: int
@@ -121,6 +144,7 @@ class ValidationReport:
     ungrounded_claims: list[str]
     grounded_qualified_names: list[str]
     is_acceptable: bool
+    spans: list[ClaimSpan] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -285,8 +309,10 @@ class CitationValidator:
     ) -> ValidationReport:
         cited_qnames = {c.qualified_name for c in chunks}
         known_prefixes = self._module_prefixes(cited_qnames)
-        claims = self._claim_re.findall(answer)
-        if not claims:
+        # Use ``finditer`` so we keep the byte offsets — the redactor
+        # downstream needs spans, not just the matched substrings.
+        matches = list(self._claim_re.finditer(answer))
+        if not matches:
             # Nothing claim-shaped to validate. We log a structured event
             # so this is auditable in production traces — an LLM answer
             # that makes ZERO specific code references is suspicious even
@@ -304,15 +330,22 @@ class CitationValidator:
                 ungrounded_claims=[],
                 grounded_qualified_names=[],
                 is_acceptable=True,
+                spans=[],
             )
         grounded: list[str] = []
         ungrounded: list[str] = []
-        for c in claims:
-            if self._is_grounded(c, cited_qnames, known_prefixes):
-                grounded.append(c)
+        spans: list[ClaimSpan] = []
+        for m in matches:
+            claim = m.group(1)
+            is_grounded = self._is_grounded(claim, cited_qnames, known_prefixes)
+            spans.append(
+                ClaimSpan(claim=claim, start=m.start(), end=m.end(), grounded=is_grounded)
+            )
+            if is_grounded:
+                grounded.append(claim)
             else:
-                ungrounded.append(c)
-        n = len(claims)
+                ungrounded.append(claim)
+        n = len(matches)
         ratio = len(grounded) / n if n else 1.0
         return ValidationReport(
             n_claims=n,
@@ -320,6 +353,7 @@ class CitationValidator:
             ungrounded_claims=ungrounded,
             grounded_qualified_names=grounded,
             is_acceptable=ratio >= self.accept_threshold,
+            spans=spans,
         )
 
     @staticmethod
@@ -428,9 +462,13 @@ class AgentConfig:
     # What to do when the validator flags the answer as ungrounded:
     #
     #   * ``redact`` (default): replace each ungrounded backticked claim
-    #     with ``[ungrounded: <claim>]`` and log the action. The answer
-    #     stays useful where it was grounded; readers see exactly which
-    #     claims failed validation.
+    #     IN PLACE (by span offset) with ``[ungrounded: <claim>]`` and
+    #     append a summary stamp to the answer. The answer stays useful
+    #     where it was grounded; readers see exactly which claims failed.
+    #     Caveat: redaction only catches claims the validator can
+    #     identify (backtick-wrapped dotted qualified names); arbitrary
+    #     prose claims pass through untouched. For stricter enforcement
+    #     use ``validation_mode="reject"``.
     #   * ``reject``: replace the entire answer with a refusal message.
     #     Use when downstream consumers must never see partial-grounded
     #     content.
@@ -713,10 +751,35 @@ class Agent:
             return answer
         if mode == "reject":
             return _REJECT_MESSAGE
-        # ``redact``: rewrite each ungrounded backticked claim. We replace
-        # the wrapped form ``\`<claim>\``` with ``[ungrounded: <claim>]``
-        # so the marker is unambiguous against the original code style.
+        # ``redact``: rewrite each ungrounded backticked claim by span
+        # offset rather than ``str.replace``. Slicing in REVERSE order
+        # keeps earlier offsets valid as later text mutates. This is what
+        # lets a grounded ``\`m.foo\``` and an ungrounded ``\`m.foo\``` in
+        # the same answer end up handled differently — ``str.replace``
+        # would have rewritten both occurrences.
         out = answer
-        for claim in report.ungrounded_claims:
-            out = out.replace(f"`{claim}`", f"[ungrounded: {claim}]")
-        return out
+        if report.spans:
+            ungrounded_spans = [s for s in report.spans if not s.grounded]
+            n_redacted = len(ungrounded_spans)
+            for span in sorted(ungrounded_spans, key=lambda s: s.start, reverse=True):
+                out = out[: span.start] + f"[ungrounded: {span.claim}]" + out[span.end :]
+        else:
+            # Backward-compat for validators that don't populate spans.
+            # ``str.replace`` is the legacy path: it cannot distinguish
+            # between grounded and ungrounded occurrences of the same
+            # backticked string, but this branch only fires for custom
+            # validators that opted out of span reporting.
+            n_redacted = len(report.ungrounded_claims)
+            for claim in report.ungrounded_claims:
+                out = out.replace(f"`{claim}`", f"[ungrounded: {claim}]")
+        # Summary stamp documents what redaction did + its limitation:
+        # backticked claims only. Arbitrary prose isn't analysed by the
+        # validator, so an answer with no backticked names produces a
+        # stamp noting "0 redactions".
+        stamp = (
+            f"\n\n[validation: {n_redacted} ungrounded claims redacted; "
+            "redact mode only handles backtick-wrapped qualified names — "
+            "arbitrary prose claims are not detected. See citations for "
+            "grounded references.]"
+        )
+        return out + stamp

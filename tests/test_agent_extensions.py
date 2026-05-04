@@ -391,3 +391,114 @@ class TestValidationModeEnforcement:
         )
         result = await agent.run("q")
         assert result.answer == "see `m.foo`"
+
+    async def test_redact_replaces_exact_span_not_string_replace(self) -> None:
+        # Same backticked claim appears twice; only the ungrounded span
+        # is redacted, the grounded one survives. This is the failure
+        # mode of the legacy ``str.replace`` redactor: it would have
+        # rewritten both occurrences, defeating the contract that the
+        # answer remains useful where it is grounded.
+        chunks = [_stored("m.foo")]
+        retriever = StubRetriever(responses=[_result(chunks)])
+        # Build a validator that uses the real CitationValidator's span
+        # extraction, then forces the second occurrence of ``m.foo`` to
+        # be reported as ungrounded.
+
+        @dataclass
+        class _SpanAwareValidator:
+            async def validate(
+                self,
+                query: str,
+                answer: str,
+                chunks: list,  # type: ignore[type-arg]
+            ) -> ValidationReport:
+                # Reuse CitationValidator to find the spans, then flip
+                # the second match to ungrounded by hand.
+                base = await CitationValidator().validate(query, answer, chunks)
+                from codex_atlas.agent import ClaimSpan  # noqa: PLC0415
+
+                spans = list(base.spans)
+                # Second span -> ungrounded.
+                assert len(spans) == 2
+                spans[1] = ClaimSpan(
+                    claim=spans[1].claim,
+                    start=spans[1].start,
+                    end=spans[1].end,
+                    grounded=False,
+                )
+                return ValidationReport(
+                    n_claims=2,
+                    n_grounded=1,
+                    ungrounded_claims=[spans[1].claim],
+                    grounded_qualified_names=[spans[0].claim],
+                    is_acceptable=False,
+                    spans=spans,
+                )
+
+        synth = _FixedAnswerSynth(text="first `m.foo`, then again `m.foo` later")
+        agent = Agent(
+            retriever,  # type: ignore[arg-type]
+            synthesizer=synth,  # type: ignore[arg-type]
+            validator=_SpanAwareValidator(),  # type: ignore[arg-type]
+        )
+        result = await agent.run("q")
+        # First occurrence (grounded) survives backticked.
+        assert "first `m.foo`," in result.answer
+        # Second occurrence (ungrounded) is rewritten.
+        assert "[ungrounded: m.foo] later" in result.answer
+
+    async def test_redact_appends_summary_stamp(self) -> None:
+        retriever = StubRetriever(responses=[_result([_stored("m.foo")])])
+        validator: Validator = _RejectingValidator(ungrounded=["m.ghost"])
+        synth = _FixedAnswerSynth(text="see `m.foo` and `m.ghost`")
+        agent = Agent(
+            retriever,  # type: ignore[arg-type]
+            synthesizer=synth,  # type: ignore[arg-type]
+            validator=validator,
+        )
+        result = await agent.run("q")
+        # The redacted answer ends with the validation summary stamp.
+        assert result.answer.rstrip().endswith("grounded references.]")
+        assert "[validation:" in result.answer
+        assert "1 ungrounded claims redacted" in result.answer
+
+    async def test_redact_documents_prose_limitation(self) -> None:
+        # Answer has no backticked claims; the validator's regex matches
+        # nothing. To force redact mode we still need an unacceptable
+        # report — a custom validator returns one with zero spans. The
+        # answer should be unchanged apart from the appended stamp,
+        # which explicitly notes that 0 claims were redacted AND that
+        # redact mode only handles backtick-wrapped names.
+
+        @dataclass
+        class _ProseRejectingValidator:
+            async def validate(
+                self,
+                query: str,
+                answer: str,
+                chunks: list,  # type: ignore[type-arg]
+            ) -> ValidationReport:
+                return ValidationReport(
+                    n_claims=0,
+                    n_grounded=0,
+                    ungrounded_claims=[],
+                    grounded_qualified_names=[],
+                    is_acceptable=False,
+                    spans=[],
+                )
+
+        retriever = StubRetriever(responses=[_result([_stored("m.foo")])])
+        synth = _FixedAnswerSynth(
+            text="The cache layer invalidates entries on write."
+        )
+        agent = Agent(
+            retriever,  # type: ignore[arg-type]
+            synthesizer=synth,  # type: ignore[arg-type]
+            validator=_ProseRejectingValidator(),  # type: ignore[arg-type]
+        )
+        result = await agent.run("q")
+        # Original prose is preserved verbatim.
+        assert "The cache layer invalidates entries on write." in result.answer
+        # Stamp explicitly notes 0 redactions + the backtick limitation.
+        assert "0 ungrounded claims redacted" in result.answer
+        assert "backtick-wrapped qualified names" in result.answer

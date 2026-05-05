@@ -129,6 +129,13 @@ def _dsn() -> str:
 _cached_store: object | None = None
 _cached_encoder: Encoder | None = None
 _cached_graph: CallGraph | None = None
+# Serialises lazy initialisation of the process-wide caches above. Two
+# concurrent ``_agent`` calls on a cold process used to each see
+# ``_cached_store is None`` and each create a ``ChunkStore`` + run the
+# DDL bootstrap; the loser's store + pool was orphaned. Acquire the
+# lock + re-check (double-checked init) so the first caller wins and
+# subsequent callers see the populated cache.
+_init_lock: asyncio.Lock = asyncio.Lock()
 
 
 async def _agent(top_k: int = 8) -> Agent:
@@ -144,14 +151,30 @@ async def _agent(top_k: int = 8) -> Agent:
     from codex_atlas.store import ChunkStore  # noqa: PLC0415
 
     global _cached_store, _cached_encoder, _cached_graph  # noqa: PLW0603
-    if _cached_encoder is None:
-        _cached_encoder = _encoder()
-    if _cached_store is None:
-        store = ChunkStore(dsn=_dsn())
-        await store.setup(dim=_cached_encoder.dim)
-        _cached_store = store
-    if _cached_graph is None:
-        _cached_graph = _graph()
+    # Fast path: every cache populated, no lock needed.
+    if (
+        _cached_encoder is not None
+        and _cached_store is not None
+        and _cached_graph is not None
+    ):
+        retriever = Retriever(
+            _cached_encoder,
+            _cached_store,  # type: ignore[arg-type]
+            _cached_graph,
+            RetrieverConfig(top_k=top_k),
+        )
+        return Agent(retriever)
+    # Cold path: serialise so concurrent first-callers don't each
+    # create a duplicate ChunkStore / pool / graph.
+    async with _init_lock:
+        if _cached_encoder is None:
+            _cached_encoder = _encoder()
+        if _cached_store is None:
+            store = ChunkStore(dsn=_dsn())
+            await store.setup(dim=_cached_encoder.dim)
+            _cached_store = store
+        if _cached_graph is None:
+            _cached_graph = _graph()
     retriever = Retriever(
         _cached_encoder,
         _cached_store,  # type: ignore[arg-type]

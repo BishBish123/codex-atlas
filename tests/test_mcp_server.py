@@ -8,8 +8,10 @@ validation rejects bad arguments.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -220,6 +222,50 @@ class TestSearchCodebaseRouteOverride:
     async def test_unknown_route_rejected(self) -> None:
         with pytest.raises(ValueError, match="unknown route"):
             await search_codebase("anything", route="not_a_route")
+
+
+class TestCachedStoreInitIdempotence:
+    async def test_cached_store_init_idempotent_under_concurrency(
+        self, monkeypatch: pytest.MonkeyPatch, fixture_graph: Path
+    ) -> None:
+        # Two concurrent ``_agent`` callers on a cold process used to
+        # each create a ``ChunkStore`` and run the DDL bootstrap; the
+        # loser's store was orphaned. The double-checked ``_init_lock``
+        # makes setup() fire exactly once.
+        # Reset module-level caches so this test exercises the cold path.
+        monkeypatch.setattr(mcp_server, "_cached_store", None)
+        monkeypatch.setattr(mcp_server, "_cached_encoder", None)
+        monkeypatch.setattr(mcp_server, "_cached_graph", None)
+
+        setup_calls = 0
+
+        class _FakeStore:
+            def __init__(self, dsn: str) -> None:
+                self.dsn = dsn
+
+            async def setup(self, dim: int) -> None:
+                nonlocal setup_calls
+                # Yield so a concurrent caller has the chance to race
+                # past the ``is None`` check — exactly the interleaving
+                # the lock must defeat.
+                await asyncio.sleep(0)
+                setup_calls += 1
+
+        # Patch the lazy import target inside ``_agent``.
+        import codex_atlas.store as store_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(store_mod, "ChunkStore", _FakeStore)
+
+        # Provide a DSN so ``_dsn()`` doesn't raise.
+        monkeypatch.setenv("POSTGRES_DSN", "postgresql://stub")
+        # The encoder factory + graph loader should still work; the
+        # graph fixture has set ATLAS_GRAPH_PATH.
+
+        async def call_agent() -> Any:
+            return await mcp_server._agent(top_k=8)
+
+        await asyncio.gather(*(call_agent() for _ in range(10)))
+        assert setup_calls == 1
 
 
 class TestCancelledSurface:

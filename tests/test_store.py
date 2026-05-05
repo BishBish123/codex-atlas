@@ -63,6 +63,59 @@ class TestTableIdentifierValidation:
         ChunkStore(dsn="postgresql://stub", table="MixedCase123")
 
 
+class TestPoolInitIdempotence:
+    async def test_pool_init_idempotent_under_concurrency(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Two concurrent first-callers used to each observe ``_pool is
+        # None`` and each fire ``asyncpg.create_pool``; the loser's pool
+        # was leaked. With the double-checked init lock, ``create_pool``
+        # is invoked exactly once even under N concurrent ``_connect``
+        # callers.
+        store = ChunkStore(dsn="postgresql://stub")
+        create_calls = 0
+
+        class _StubConn:
+            async def execute(self, *_args: Any, **_kwargs: Any) -> str:
+                return "OK"
+
+        class _StubAcquire:
+            async def __aenter__(self) -> _StubConn:
+                return _StubConn()
+
+            async def __aexit__(self, *_exc: Any) -> None:
+                return None
+
+        class _StubPool:
+            def acquire(self) -> _StubAcquire:
+                return _StubAcquire()
+
+            async def close(self) -> None:  # pragma: no cover
+                pass
+
+        async def fake_create_pool(*_args: Any, **_kwargs: Any) -> _StubPool:
+            nonlocal create_calls
+            # Yield to the loop so a concurrent caller has the chance
+            # to observe the pre-assignment ``_pool is None`` state —
+            # this is exactly the interleaving the lock must defeat.
+            await asyncio.sleep(0)
+            create_calls += 1
+            return _StubPool()
+
+        import codex_atlas.store as store_mod  # noqa: PLC0415
+
+        monkeypatch.setattr(store_mod.asyncpg, "create_pool", fake_create_pool)
+
+        async def open_and_close() -> None:
+            async with store._connect():
+                pass
+
+        await asyncio.gather(*(open_and_close() for _ in range(10)))
+        # Without the double-checked lock, two of these would race past
+        # the ``is None`` check and call create_pool twice.
+        assert create_calls == 1
+
+
 class TestSetupIdempotence:
     async def test_setup_twice_short_circuits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The second ``setup`` call with the same dim must NOT re-issue

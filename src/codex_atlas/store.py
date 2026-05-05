@@ -97,18 +97,28 @@ class ChunkStore:
         # Set once setup() has run successfully; lets repeat callers
         # short-circuit the DDL without skipping pool initialisation.
         self._bootstrapped: bool = False
+        # Serialises lazy pool creation. Without this, two concurrent
+        # ``_connect`` callers can both observe ``_pool is None`` and
+        # each fire ``asyncpg.create_pool`` — the second one wins the
+        # assignment and the first one's pool is silently leaked. The
+        # double-checked init under the lock fixes the race.
+        self._pool_lock: asyncio.Lock = asyncio.Lock()
 
     @asynccontextmanager
     async def _connect(self) -> AsyncIterator[asyncpg.Connection]:
         # Lazy-init the pool on first acquisition so callers that only
         # ever pass through ``setup`` (e.g. tests using the InMemory
-        # variant) don't pay for a connect they never need.
+        # variant) don't pay for a connect they never need. Two
+        # concurrent first-callers race on the ``is None`` check, so
+        # acquire the lock and re-check before creating the pool.
         if self._pool is None:
-            self._pool = await asyncpg.create_pool(
-                self._dsn,
-                min_size=self._min_pool_size,
-                max_size=self._max_pool_size,
-            )
+            async with self._pool_lock:
+                if self._pool is None:
+                    self._pool = await asyncpg.create_pool(
+                        self._dsn,
+                        min_size=self._min_pool_size,
+                        max_size=self._max_pool_size,
+                    )
         async with self._pool.acquire() as conn:
             yield conn
 

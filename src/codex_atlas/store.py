@@ -16,6 +16,7 @@ would just hold idle connections.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -279,6 +280,14 @@ class InMemoryChunkStore:
     Cosine similarity is computed in NumPy on every search — fine for
     the 12-question eval set + small fixture corpora; do NOT use for
     > a few thousand chunks. The pgvector backend exists for that.
+
+    Concurrency contract: ``setup``, ``upsert_chunks``, ``search`` and
+    ``fetch_by_qualified_name`` are all serialised through an
+    ``asyncio.Lock``. Concurrent callers see a consistent view of the
+    store — a ``search`` started while an ``upsert_chunks`` is in flight
+    blocks until the upsert finishes. Without the lock the concurrent
+    iteration over ``_vectors.items()`` raised ``RuntimeError: dictionary
+    changed size during iteration``.
     """
 
     def __init__(self) -> None:
@@ -287,14 +296,21 @@ class InMemoryChunkStore:
         # preserved by plain dict in 3.7+.
         self._rows: dict[str, StoredChunk] = {}
         self._vectors: dict[str, np.ndarray] = {}
+        # All public methods that touch ``_rows``/``_vectors`` acquire
+        # this lock so the in-memory store is concurrent-safe — see
+        # class docstring. Constructed lazily on first use because an
+        # ``asyncio.Lock`` requires a running loop in some Python
+        # versions, and tests construct the store outside one.
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def setup(self, dim: int, drop_existing: bool = False) -> None:
         if dim <= 0:
             raise ValueError("dim must be positive")
-        if drop_existing:
-            self._rows.clear()
-            self._vectors.clear()
-        self._dim = dim
+        async with self._lock:
+            if drop_existing:
+                self._rows.clear()
+                self._vectors.clear()
+            self._dim = dim
 
     async def upsert_chunks(
         self, chunks: Sequence[Chunk], vectors: np.ndarray, batch_size: int = 256
@@ -309,20 +325,21 @@ class InMemoryChunkStore:
             raise ValueError(f"vector dim {vectors.shape[1]} != setup dim {self._dim}")
         if vectors.dtype != np.float32:
             vectors = vectors.astype(np.float32, copy=False)
-        for i, chunk in enumerate(chunks):
-            cid = chunk.chunk_id()
-            self._rows[cid] = StoredChunk(
-                chunk_id=cid,
-                qualified_name=chunk.qualified_name,
-                file_path=chunk.file_path,
-                lineno_start=chunk.lineno_start,
-                lineno_end=chunk.lineno_end,
-                kind=chunk.kind,
-                text=chunk.text,
-                score=1.0,
-            )
-            self._vectors[cid] = vectors[i].copy()
-        return len(chunks)
+        async with self._lock:
+            for i, chunk in enumerate(chunks):
+                cid = chunk.chunk_id()
+                self._rows[cid] = StoredChunk(
+                    chunk_id=cid,
+                    qualified_name=chunk.qualified_name,
+                    file_path=chunk.file_path,
+                    lineno_start=chunk.lineno_start,
+                    lineno_end=chunk.lineno_end,
+                    kind=chunk.kind,
+                    text=chunk.text,
+                    score=1.0,
+                )
+                self._vectors[cid] = vectors[i].copy()
+            return len(chunks)
 
     async def search(self, query_vec: np.ndarray, k: int = 8) -> list[StoredChunk]:
         if self._dim is None:
@@ -333,37 +350,39 @@ class InMemoryChunkStore:
             raise ValueError(
                 f"query_vec must be 1-D of dim {self._dim}, got {query_vec.shape!r}"
             )
-        if not self._rows:
-            return []
-        # Cosine similarity = (a . b) / (|a| |b|). Compute against every
-        # stored vector — O(n) per query, fine for the in-memory backend.
-        q = query_vec.astype(np.float32, copy=False)
-        q_norm = float(np.linalg.norm(q)) or 1.0
-        results: list[tuple[float, StoredChunk]] = []
-        for cid, vec in self._vectors.items():
-            v_norm = float(np.linalg.norm(vec)) or 1.0
-            cos = float(np.dot(q, vec) / (q_norm * v_norm))
-            row = self._rows[cid]
-            results.append(
-                (
-                    cos,
-                    StoredChunk(
-                        chunk_id=row.chunk_id,
-                        qualified_name=row.qualified_name,
-                        file_path=row.file_path,
-                        lineno_start=row.lineno_start,
-                        lineno_end=row.lineno_end,
-                        kind=row.kind,
-                        text=row.text,
-                        score=cos,
-                    ),
+        async with self._lock:
+            if not self._rows:
+                return []
+            # Cosine similarity = (a . b) / (|a| |b|). Compute against every
+            # stored vector — O(n) per query, fine for the in-memory backend.
+            q = query_vec.astype(np.float32, copy=False)
+            q_norm = float(np.linalg.norm(q)) or 1.0
+            results: list[tuple[float, StoredChunk]] = []
+            for cid, vec in self._vectors.items():
+                v_norm = float(np.linalg.norm(vec)) or 1.0
+                cos = float(np.dot(q, vec) / (q_norm * v_norm))
+                row = self._rows[cid]
+                results.append(
+                    (
+                        cos,
+                        StoredChunk(
+                            chunk_id=row.chunk_id,
+                            qualified_name=row.qualified_name,
+                            file_path=row.file_path,
+                            lineno_start=row.lineno_start,
+                            lineno_end=row.lineno_end,
+                            kind=row.kind,
+                            text=row.text,
+                            score=cos,
+                        ),
+                    )
                 )
-            )
-        results.sort(key=lambda t: t[0], reverse=True)
-        return [r[1] for r in results[:k]]
+            results.sort(key=lambda t: t[0], reverse=True)
+            return [r[1] for r in results[:k]]
 
     async def fetch_by_qualified_name(self, qualified_name: str) -> StoredChunk | None:
-        for row in self._rows.values():
-            if row.qualified_name == qualified_name:
-                return row
-        return None
+        async with self._lock:
+            for row in self._rows.values():
+                if row.qualified_name == qualified_name:
+                    return row
+            return None

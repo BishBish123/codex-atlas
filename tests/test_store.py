@@ -7,6 +7,7 @@ identifier validation, setup idempotence, and pool lifecycle.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -177,3 +178,50 @@ class TestInMemoryChunkStoreRoundTrip:
         bad_vectors = np.zeros((1, 8), dtype=np.float32)
         with pytest.raises(ValueError, match="dim"):
             await store.upsert_chunks(chunks, bad_vectors)
+
+    async def test_in_memory_store_concurrent_upsert_and_search(self) -> None:
+        # Without the per-store lock, ``search`` iterating ``_vectors``
+        # while ``upsert_chunks`` mutated it raised
+        # ``RuntimeError: dictionary changed size during iteration``.
+        # Fire many upserts + searches concurrently and assert (1) no
+        # exceptions escape, (2) the final state is consistent (all
+        # upserted chunks present, search results don't reference dropped
+        # ids).
+        store = InMemoryChunkStore()
+        await store.setup(dim=8)
+        rng = np.random.default_rng(seed=7)
+        # Pre-seed so search has rows to iterate over from the start.
+        seed_chunks = [_chunk(f"m.seed_{i}", i) for i in range(20)]
+        seed_vecs = rng.standard_normal((20, 8)).astype(np.float32)
+        await store.upsert_chunks(seed_chunks, seed_vecs)
+
+        async def upsert_batch(start: int) -> None:
+            chunks = [_chunk(f"m.batch_{start}_{i}", start * 100 + i) for i in range(10)]
+            vecs = rng.standard_normal((10, 8)).astype(np.float32)
+            await store.upsert_chunks(chunks, vecs)
+
+        async def do_search() -> list[str]:
+            qv = rng.standard_normal(8).astype(np.float32)
+            res = await store.search(qv, k=5)
+            return [r.qualified_name for r in res]
+
+        # Mix 10 upsert batches with 20 searches, all firing in parallel.
+        tasks: list[asyncio.Future[Any]] = []
+        for i in range(10):
+            tasks.append(asyncio.ensure_future(upsert_batch(i)))
+        for _ in range(20):
+            tasks.append(asyncio.ensure_future(do_search()))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # No RuntimeError leaked from concurrent dict iteration.
+        for r in results:
+            assert not isinstance(r, BaseException), r
+
+        # Final state: all 20 seed chunks + 10 batches * 10 = 120 rows.
+        for i in range(20):
+            assert (await store.fetch_by_qualified_name(f"m.seed_{i}")) is not None
+        for batch in range(10):
+            for i in range(10):
+                assert (
+                    await store.fetch_by_qualified_name(f"m.batch_{batch}_{i}")
+                ) is not None

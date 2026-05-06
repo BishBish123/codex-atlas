@@ -245,6 +245,44 @@ class TestHybridUsesScorer:
         # Highest-cosine seed wins regardless of original ordering.
         assert result.chunks[0].qualified_name == "m.b"
 
+    async def test_hybrid_score_decays_with_graph_depth(self) -> None:
+        # Graph: m.a -> m.b -> m.c. Seed is m.a only. With
+        # ``graph_depth=2`` the 1-hop neighbour ``m.b`` and the 2-hop
+        # neighbour ``m.c`` are both expanded; under the previous
+        # implementation both got the SAME ``graph_depth`` distance, so
+        # the scorer couldn't tell them apart. With per-node BFS depth,
+        # the 1-hop neighbour gets distance=1 and outranks the 2-hop
+        # neighbour at distance=2 (decay 1/(1+d)).
+        seeds = [_stored("m.a", score=0.0, text="")]
+        store = AsyncMock()
+        store.search.return_value = seeds
+        # Equal cosine for the expansions so only graph distance
+        # differentiates them.
+        store.fetch_by_qualified_name.side_effect = lambda q: _stored(
+            q, score=0.0, text=""
+        )
+        r = Retriever(
+            FakeEncoder(dim=8),
+            store,
+            _mk_graph(),
+            RetrieverConfig(
+                top_k=3,
+                graph_depth=2,
+                # Score purely on graph distance for a clean assertion.
+                hybrid_weight_cosine=0.0,
+                hybrid_weight_graph=1.0,
+                hybrid_weight_fulltext=0.0,
+            ),
+        )
+        result = await r.retrieve("auth-related findings here")
+        assert result.route is Route.HYBRID
+        names = [c.qualified_name for c in result.chunks]
+        # Seed (distance 0) first, then 1-hop, then 2-hop. With
+        # collapsed depths, m.b and m.c would have been tied — the
+        # decay only differentiates them when real BFS depth flows
+        # through.
+        assert names.index("m.b") < names.index("m.c")
+
 
 class TestSummarizationMaterialisesExpansions:
     """``_summarization`` returns chunks for both seed AND graph neighbours."""

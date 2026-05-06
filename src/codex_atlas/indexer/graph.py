@@ -164,6 +164,53 @@ class CallGraph:
         backward = set(self.find_callers(qualified_name, depth))
         return sorted(forward | backward)
 
+    def neighbors_with_depth(
+        self, qualified_name: str, depth: int = 1
+    ) -> dict[str, int]:
+        """Return BFS hop counts for every node within ``depth`` hops.
+
+        Used by the hybrid retrieval scorer so 1-hop neighbours score
+        higher than 2-hop neighbours under the ``1 / (1 + d)`` decay.
+        ``neighbors`` collapses both depths to the same flat list and
+        loses that information; this method preserves it.
+
+        The result excludes ``qualified_name`` itself. Both call
+        directions (callers + callees) are merged; the smaller hop
+        count wins when a node is reachable in both directions at
+        different depths.
+        """
+        if qualified_name not in self._g:
+            return {}
+        if depth <= 0:
+            raise ValueError("depth must be positive")
+        out: dict[str, int] = {}
+        for predecessors in (True, False):
+            seen: set[str] = {qualified_name}
+            frontier: set[str] = {qualified_name}
+            for hop in range(1, depth + 1):
+                next_frontier: set[str] = set()
+                for node in frontier:
+                    edges = (
+                        self._g.in_edges(node, keys=True, data=True)
+                        if predecessors
+                        else self._g.out_edges(node, keys=True, data=True)
+                    )
+                    for u, v, _key, data in edges:
+                        if data.get("kind") != EDGE_CALLS:
+                            continue
+                        other = u if predecessors else v
+                        if other in seen:
+                            continue
+                        seen.add(other)
+                        next_frontier.add(other)
+                        existing = out.get(other)
+                        if existing is None or hop < existing:
+                            out[other] = hop
+                frontier = next_frontier
+                if not frontier:
+                    break
+        return out
+
     def caller_callee_neighborhood(
         self, qualified_name: str, depth: int = 2
     ) -> dict[str, list[str]]:

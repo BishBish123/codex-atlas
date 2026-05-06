@@ -322,27 +322,35 @@ class Retriever:
         return chunks, related
 
     async def _hybrid(self, query: str) -> tuple[list[StoredChunk], list[str]]:
-        # Stage 1: vector top-k for the seed. Stage 2: 1-hop graph
-        # neighbours. Stage 3: rank the union with ``hybrid_score`` so
-        # cosine, graph proximity, and term overlap all contribute —
-        # otherwise the seed-then-append order produced by stages 1+2
-        # would dominate even when an expanded neighbour is a better
-        # match. We keep the discovery-order ``expansions`` list as the
-        # auxiliary "extras" return so the agent can still see the
-        # neighbour names, irrespective of the ranking cut.
+        # Stage 1: vector top-k for the seed. Stage 2: graph neighbours
+        # up to ``graph_depth`` hops, with per-node hop counts so the
+        # scorer can decay 2-hop neighbours below 1-hop neighbours.
+        # Stage 3: rank the union with ``hybrid_score`` so cosine, graph
+        # proximity, and term overlap all contribute — otherwise the
+        # seed-then-append order produced by stages 1+2 would dominate
+        # even when an expanded neighbour is a better match. We keep the
+        # discovery-order ``expansions`` list as the auxiliary "extras"
+        # return so the agent can still see the neighbour names,
+        # irrespective of the ranking cut.
         seed = await self._vector_topk(query, self._config.top_k)
         seed_qnames = {c.qualified_name for c in seed}
         graph_distances: dict[str, int] = dict.fromkeys(seed_qnames, 0)
         expansions: list[str] = []
         seen = set(seed_qnames)
         for c in seed:
-            for neighbour in self._graph.neighbors(
+            depths = self._graph.neighbors_with_depth(
                 c.qualified_name, depth=self._config.graph_depth
-            ):
+            )
+            # Walk neighbours in increasing-hop order so the discovery
+            # list reflects hop ordering and ``graph_distances`` records
+            # the *minimum* observed depth across multiple seed paths.
+            for neighbour, hop in sorted(depths.items(), key=lambda t: t[1]):
                 if neighbour not in seen:
                     expansions.append(neighbour)
                     seen.add(neighbour)
-                    graph_distances[neighbour] = self._config.graph_depth
+                existing = graph_distances.get(neighbour)
+                if existing is None or hop < existing:
+                    graph_distances[neighbour] = hop
         # Materialise the expansions so the ranker sees real chunk text.
         candidates: list[StoredChunk] = list(seed)
         for q in expansions[: self._config.top_k]:

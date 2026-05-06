@@ -182,6 +182,15 @@ class TestSearchCodeTopK:
         with pytest.raises(ValueError, match="top_k"):
             await search_code("anything", top_k=51)
 
+    async def test_search_code_rejects_blank_query(self) -> None:
+        # Mirrors the existing search_codebase guard. A whitespace-only
+        # query has no useful retrieval signal and the classifier would
+        # silently fall through to the LOOKUP default.
+        with pytest.raises(ValueError, match="blank"):
+            await search_code("   ")
+        with pytest.raises(ValueError, match="blank"):
+            await search_code("")
+
 
 class TestSearchCodebaseTopK:
     async def test_search_codebase_respects_top_k(

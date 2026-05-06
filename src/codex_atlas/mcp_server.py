@@ -209,6 +209,8 @@ def _to_response(result: AgentResult) -> SearchResponse:
 @mcp.tool
 async def search_code(query: str, top_k: int = 8) -> SearchResponse:
     """Adaptive-route code search. Returns synthesised answer + citations."""
+    if not query.strip():
+        raise ValueError("query must not be blank")
     if top_k <= 0:
         raise ValueError("top_k must be positive")
     if top_k > 50:

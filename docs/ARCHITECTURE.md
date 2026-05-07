@@ -148,7 +148,47 @@ FastMCP wrapping seven tools and one resource:
 
 ADR-004 documents the tool-shape decisions.
 
-## 7. Eval harness
+## 7. Observability
+
+`src/codex_atlas/observability/`
+
+An env-key-gated Langfuse tracing adapter that subscribes to the agent's
+structured `trace` and `tool_calls` lists and emits them as Langfuse spans.
+
+**Components:**
+
+- `LangfuseTracer` — live tracer; imports the `langfuse` SDK lazily so the
+  module loads without it installed. Supports both v2/v3 (`trace()` /
+  `span()` API) and v4 (`start_observation()` API).
+- `NullTracer` — no-op fallback with the same interface. Used when
+  `LANGFUSE_PUBLIC_KEY` or `LANGFUSE_SECRET_KEY` are absent.
+- `make_tracer()` — factory; returns `LangfuseTracer` when both keys are
+  set, `NullTracer` otherwise.
+
+**Env vars:**
+
+| Variable | Effect |
+| --- | --- |
+| `LANGFUSE_PUBLIC_KEY` | Required to enable live tracing. |
+| `LANGFUSE_SECRET_KEY` | Required to enable live tracing. |
+| `LANGFUSE_HOST` | Optional. Defaults to `https://cloud.langfuse.com`. |
+
+**Instrumentation points in `Agent.run`:**
+
+1. `start_run(query)` — opens a top-level Langfuse trace.
+2. `record_event(trace_id, event)` — called after each `TraceEvent` and
+   `ToolCall` is appended to the internal state (classify, retrieve, grade,
+   rewrite, answer, validate, cancel).
+3. `record_validation(trace_id, report)` — emits the `CitationValidator`
+   result as a separate span.
+4. `finish_run(trace_id, result)` — attaches the final answer summary to
+   the trace and calls `flush()` so buffered events survive short-lived
+   CLI invocations.
+
+The `tracer` is a constructor arg on `Agent` (default: `make_tracer()`),
+so tests can inject `NullTracer` explicitly without touching env vars.
+
+## 8. Eval harness
 
 `src/codex_atlas/eval/`
 
@@ -169,6 +209,204 @@ losing accuracy, not just *that* it is.
 JSON baseline; the CLI exits non-zero on regression beyond the
 configured tolerance. `write_failure_report` dumps a per-question
 JSONL so debugging is `cat | jq`.
+
+## ADR-05: Store protocol + env-var-driven backend selection
+
+### Context
+
+The original `store.py` module contained a single concrete pgvector adapter
+(`ChunkStore`) and a test-only `InMemoryChunkStore`. There was no first-class
+way for operators to switch backends without modifying source: the `cli.py`
+chose between them via `--store=memory` / `--store=postgres` flag logic, and
+the `mcp_server.py` read `ATLAS_STORE` for the same choice. Adding a second
+pgvector adapter (with a different DDL schema and simpler method surface) while
+keeping existing code working required a stable public interface and a clean
+dispatch point.
+
+### Decision
+
+1. **Convert `store.py` to a package** (`store/`). All existing names (`ChunkStore`,
+   `InMemoryChunkStore`, `StoredChunk`, `ChunkStoreProtocol`, …) are re-exported
+   from `store/__init__.py` so every existing `from codex_atlas.store import X`
+   import continues to work unchanged.
+
+2. **Add `PgVectorChunkStore`** in `store/pgvector.py`. This backend uses a
+   simplified schema (named `chunks`, embedding column named `embedding` instead
+   of `vec`) and ivfflat indexing instead of HNSW, and exposes a lighter method
+   surface (`upsert_chunks(list[StoredChunk])`, `upsert_with_embeddings`, `search`,
+   `fetch_by_qualified_name`, `get`, `clear`). It is gated behind `ATLAS_PG_DSN`
+   and soft-fails the `asyncpg`/`pgvector` imports so the package stays importable
+   on memory-only installs.
+
+3. **Add `make_chunk_store()`** in `store/__init__.py`. A single factory that reads
+   `ATLAS_CHUNK_STORE` (`memory` | `pgvector`) and dispatches:
+   - `memory`   → `InMemoryChunkStore()` (default)
+   - `pgvector` → `PgVectorChunkStore(dsn=os.environ["ATLAS_PG_DSN"])`
+   Unknown backends raise `RuntimeError` with an actionable message.
+
+4. **No changes to `cli.py` or `mcp_server.py`**. The existing `--store` flag
+   logic and `ATLAS_STORE` env var remain in place and continue to operate the
+   existing `ChunkStore` / `InMemoryChunkStore` pair. `make_chunk_store()` is
+   an additive hook for new tooling that wants env-var-driven dispatch.
+
+### Rationale
+
+- **Backward compatibility**: converting to a package instead of adding a second
+  flat module preserves every existing import without a grep-and-replace.
+- **Single dispatch point**: `make_chunk_store()` is the only place that reads
+  `ATLAS_CHUNK_STORE`, so adding a third backend (e.g. SQLite, Qdrant) is a
+  one-function change with no ripple to callers.
+- **Soft-fail imports**: `asyncpg` and `pgvector` are already hard dependencies
+  in `pyproject.toml`, but the `try/except ImportError` guards in `pgvector.py`
+  make the error message actionable on mis-configured installs rather than
+  producing an opaque `ModuleNotFoundError` at import time.
+- **ivfflat over HNSW for `PgVectorChunkStore`**: ivfflat appends cheaply on
+  INSERT (no graph rebuild), which suits the incremental-reindex pattern the
+  CLI uses. HNSW is retained in the original `ChunkStore` where its higher
+  recall-at-low-probes matters for the production query path.
+
+## ADR-06: Dual call-graph backend — NetworkX (default) + Neo4j (optional)
+
+### Context
+
+The original call graph was implemented entirely in-memory with NetworkX
+(`src/codex_atlas/indexer/graph.py`). For single-user portfolio deployments
+(the primary target) this is ideal — a 50K-node graph fits in RAM, persistence
+is a single diffable JSON file, and no external service is required.
+
+As codex-atlas is deployed against larger mono-repos (500K+ symbols) or in
+multi-user team settings, the in-memory graph becomes a bottleneck: the JSON
+snapshot can exceed several hundred MB and every reader must load the full
+graph before answering even a single query. Neo4j AuraDB solves both problems —
+it persists the graph natively and evaluates Cypher queries server-side — but
+requiring it for every user would break the "zero-infra quick-start" promise.
+
+### Decision
+
+1. **Add `Neo4jCallGraph`** in `src/codex_atlas/indexer/neo4j_graph.py`.
+   Uses the official `neo4j` async Python driver. Reads `ATLAS_NEO4J_URI`,
+   `ATLAS_NEO4J_USERNAME` (default `neo4j`), and `ATLAS_NEO4J_PASSWORD` from
+   environment variables. The driver import is a soft-fail — the module loads
+   cleanly when `neo4j` is absent; `Neo4jCallGraph()` raises `ImportError` at
+   instantiation time with an actionable message.
+
+2. **Add `make_call_graph()` factory** in `src/codex_atlas/indexer/__init__.py`.
+   Reads `ATLAS_GRAPH_BACKEND` (`networkx` | `neo4j`). Default is `networkx`
+   so no existing deployment breaks. Unknown values raise `RuntimeError`.
+
+3. **Add `--graph-backend` option to `atlas index`**. Passes through to the
+   factory via env-var so operators can switch backends per-run without
+   modifying their environment permanently.
+
+4. **Ship `docker-compose.neo4j.yml`** with `make neo4j-up` / `make neo4j-down`
+   targets for local development, mirroring the existing pgvector compose file.
+
+5. **Add `neo4j>=5.20` to the `[real]` extras** in `pyproject.toml`.
+   Not a hard dependency — memory-only installs stay lean.
+
+### Rationale
+
+- **Default unchanged**: `ATLAS_GRAPH_BACKEND` defaults to `networkx`. Every
+  existing test, CLI invocation, and MCP server configuration continues to
+  work with zero changes.
+- **Soft-fail imports**: identical pattern to `PgVectorChunkStore`. Importable
+  without the driver; actionable error at runtime.
+- **Cypher schema is minimal and idempotent**: one uniqueness constraint
+  (`symbol_qname`) + one index (`symbol_module`). Both use `IF NOT EXISTS`.
+- **Relationship types are allow-listed**: Cypher does not support parameterised
+  relationship types, so `add_edge()` validates `kind` against a fixed
+  frozenset (`CALLS`, `IMPORTS`) and formats it into the template string.
+  This prevents injection while keeping the API clean.
+
+### When to pick each backend
+
+| Criteria | Pick NetworkX | Pick Neo4j |
+| --- | --- | --- |
+| Quick-start / CI | Yes | No |
+| Offline / no Docker | Yes | No |
+| > 500K symbols | No | Yes |
+| Multi-user sharing | No | Yes |
+| Need graph analytics (PageRank, shortest path) | No | Yes |
+
+## ADR-07: Dual agent backend — hand-rolled (default) + LangGraph (optional)
+
+### Context
+
+The project brief promises LangGraph as the orchestration framework.
+`agent.py` implements a "LangGraph-style" hand-rolled async state machine
+(classify → retrieve → grade → rewrite_query → answer → validate → cancel)
+that deliberately avoids the real LangGraph package to keep cold-start fast
+and the dependency list short.
+
+As codex-atlas is positioned as a serious RAG reference, reviewers correctly
+ask why it uses a bespoke state machine rather than the industry-standard
+framework. Adding the real LangGraph backend answers that question without
+breaking any existing deployment.
+
+### Decision
+
+1. **Add `LangGraphAgent`** in `src/codex_atlas/agent_langgraph.py`.
+   Uses a real `StateGraph` with seven nodes (classify, retrieve, grade,
+   rewrite_query, answer, validate, cancel) and conditional edges:
+   - `grade` → `rewrite_query` (when grade < threshold AND attempts < max)
+   - `grade` → `answer` (otherwise)
+   - `rewrite_query` → `retrieve` (loop-back edge)
+   - `answer` → `validate` → `END`
+   The `langgraph` import is soft-fail: the module loads cleanly without
+   the package installed; `LangGraphAgent.__init__` raises a `RuntimeError`
+   with an install hint at construction time.
+
+2. **Add `make_agent()` factory** in `src/codex_atlas/__init__.py`.
+   Reads `ATLAS_AGENT_BACKEND` (env var) or a `backend=` kwarg:
+   - `"hand-rolled"` (default) → existing `Agent`
+   - `"langgraph"` → `LangGraphAgent`
+   Unknown values raise `RuntimeError` with valid choices listed.
+
+3. **Add `--backend hand-rolled|langgraph` to `atlas ask`** CLI.
+   Default unchanged (`hand-rolled`). The flag sets the backend for a
+   single invocation without touching env vars.
+
+4. **Add `langgraph>=0.2` to `[real]` extras** in `pyproject.toml`.
+   Not a hard dependency — memory-only installs stay lean.
+
+### Rationale
+
+- **Default unchanged**: `ATLAS_AGENT_BACKEND` defaults to `"hand-rolled"`.
+  Every existing test, CLI invocation, MCP server, and eval run continues
+  to work with zero changes. No new transitive imports at startup.
+- **Same Protocol implementations**: `LangGraphAgent` reuses the same
+  `Retriever`, `Grader`, `Synthesizer`, `Validator` Protocol objects as
+  `Agent`. The swap is purely orchestration — behavior is identical.
+- **Soft-fail import**: identical pattern to `PgVectorChunkStore` and
+  `Neo4jCallGraph`. The package stays importable without langgraph; the
+  error is actionable at construction time rather than at `import` time.
+- **Why hand-rolled stays default**:
+  - No extra dependency (`langgraph>=0.2` pulls `pydantic`, `langchain-core`,
+    `httpx`, etc. — adds ~15 transitive packages).
+  - Faster cold-start: the hand-rolled machine starts in microseconds; the
+    LangGraph graph compilation + `StateGraph.compile()` adds overhead.
+  - Simpler debugging: the hand-rolled machine is ~400 lines of vanilla
+    asyncio with no framework magic between nodes.
+  - CI stays hermetic: the langgraph tests use a minimal in-process stub
+    and never require the real package.
+
+### State graph shape
+
+```
+retrieve → grade ─┐
+    ▲              │ grade < threshold AND attempts < max
+    │              ▼
+    └── rewrite_query
+                   │
+                   │ grade >= threshold OR attempts exhausted
+                   ▼
+               answer → validate → END
+```
+
+Seven nodes total; the `cancel` node is registered but only reachable
+if a caller injects a cancellation signal into the state before graph
+invocation (the current implementation does not exercise it, but it
+mirrors the hand-rolled machine's node vocabulary for parity).
 
 ## CI
 

@@ -66,7 +66,7 @@ def load_sentence_transformer_encoder(model_name: str = "BAAI/bge-small-en-v1.5"
         ) from e
 
     @dataclass
-    class _ST(Encoder):
+    class _ST:
         name: str
         dim: int
         model: SentenceTransformer

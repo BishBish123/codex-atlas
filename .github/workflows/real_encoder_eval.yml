@@ -1,0 +1,70 @@
+name: real-encoder-eval
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly on Monday at 04:00 UTC
+    - cron: "0 4 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  bge-eval:
+    runs-on: ubuntu-latest
+    env:
+      ATLAS_ENCODER: BAAI/bge-small-en-v1.5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Sync deps (dev + embed)
+        run: uv sync --extra dev --extra embed
+
+      # Build the in-memory index with the real encoder so the vector
+      # store is semantically meaningful when the eval harness runs.
+      - name: Index corpus (bge-small-en-v1.5)
+        run: |
+          uv run atlas index src/ --store=memory \
+            --encoder BAAI/bge-small-en-v1.5
+
+      # Run the golden 30-question eval with the real encoder.
+      # Outputs: evals/REPORT.bge.md (markdown) + evals/scores-bge.json (raw scores).
+      - name: Run eval (bge-small-en-v1.5)
+        run: |
+          uv run atlas eval \
+            --encoder BAAI/bge-small-en-v1.5 \
+            --store=memory \
+            --json-out evals/scores-bge.json \
+            --out evals/REPORT.bge.md
+
+      # Upload both artefacts so the user can download and commit them.
+      - name: Upload eval report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bge-eval-report
+          path: |
+            evals/REPORT.bge.md
+            evals/scores-bge.json
+          retention-days: 30
+
+      # Diff the newly-generated report against the committed placeholder.
+      # A non-zero diff is informational only -- it does NOT fail the job.
+      - name: Diff against committed placeholder
+        run: |
+          if git diff --exit-code evals/REPORT.bge.md; then
+            echo "REPORT.bge.md unchanged"
+          else
+            echo "REPORT.bge.md differs from committed placeholder -- download the artifact and commit it."
+          fi
+        continue-on-error: true

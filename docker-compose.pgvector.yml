@@ -1,0 +1,34 @@
+version: "3.9"
+
+# Local Postgres + pgvector for development.
+#
+# Usage:
+#   make pg-up    # Start the container in the background
+#   make pg-down  # Stop and remove the container + volume
+#
+# Connection string (export before running atlas with --store=pgvector):
+#   export ATLAS_PG_DSN=postgresql://atlas:atlas@localhost:5433/atlas
+#
+# The port is 5433 (not the default 5432) to avoid collisions with any
+# system Postgres instance you may already be running.
+
+services:
+  pgvector:
+    image: pgvector/pgvector:pg17
+    container_name: codex_atlas_pgvector
+    environment:
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: atlas
+      POSTGRES_DB: atlas
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atlas -d atlas"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgvector_data:

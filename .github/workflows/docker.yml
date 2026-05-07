@@ -1,0 +1,62 @@
+name: docker
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2  # v3
+
+      - name: Build image
+        run: |
+          docker build \
+            --tag codex-atlas:ci \
+            --cache-from type=gha \
+            --cache-to   type=gha,mode=max \
+            .
+
+      - name: Start container
+        run: |
+          docker run \
+            --detach \
+            --name codex-atlas-ci \
+            --publish 8000:8000 \
+            --env ATLAS_STORE=memory \
+            codex-atlas:ci
+
+      - name: Wait for TCP port 8000
+        run: |
+          for i in $(seq 1 20); do
+            if nc -z localhost 8000; then
+              echo "healthz OK (port 8000 open)"
+              exit 0
+            fi
+            echo "Waiting... attempt $i/20"
+            sleep 2
+          done
+          echo "Container port 8000 never opened"
+          docker logs codex-atlas-ci
+          exit 1
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs codex-atlas-ci || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f codex-atlas-ci || true

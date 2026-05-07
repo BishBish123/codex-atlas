@@ -48,6 +48,18 @@ embed = [
     "sentence-transformers>=3.0,<4 ; (sys_platform == 'darwin' and platform_machine == 'arm64') or sys_platform == 'linux' or sys_platform == 'win32'",
     "torch>=2.2,<2.8 ; (sys_platform == 'darwin' and platform_machine == 'arm64') or sys_platform == 'linux' or sys_platform == 'win32'",
 ]
+real = [
+    "langfuse>=2.50",
+    # LangGraph orchestration framework for the optional langgraph agent backend.
+    # Latest stable: 1.1.10 (2026-04-27, pypi.org/project/langgraph/).
+    "langgraph>=0.2",
+    # Neo4j async driver for the optional graph backend.
+    # Latest stable: 6.2.0 (2026-05-04, pypi.org/project/neo4j/).
+    "neo4j>=5.20",
+    # RAGAS eval framework for the optional LLM-judge metrics.
+    # Latest stable: 0.2.x (pypi.org/project/ragas/).
+    "ragas>=0.2",
+]
 
 dev = [
     "pytest>=8.2",
@@ -68,7 +80,7 @@ packages = ["src/codex_atlas"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+src = ["src", "tests", "examples"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "PL", "RUF", "ASYNC", "S"]
@@ -76,9 +88,24 @@ ignore = ["PLR0913", "PLR2004", "E501", "S101", "S603", "S607"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["PLR2004", "S101", "S608", "ASYNC"]
-"src/codex_atlas/cli.py" = ["B008", "ASYNC240"]  # write_text inside asyncio.run is OK
+# test_examples.py inserts a sys.path entry before importing mcp_client (not on PYTHONPATH)
+"tests/test_examples.py" = ["I001"]
+"src/codex_atlas/cli.py" = ["B008", "ASYNC240", "PLC0415"]  # write_text inside asyncio.run is OK; calibrate uses lazy import
 # Table name comes from a typed config field, not user input.
 "src/codex_atlas/store.py" = ["S608"]
+"src/codex_atlas/store/_core.py" = ["S608"]
+# Judge package uses lazy httpx imports so the module loads without httpx installed.
+"src/codex_atlas/judge/llm.py" = ["PLC0415"]
+"src/codex_atlas/judge/factory.py" = ["PLC0415"]
+"src/codex_atlas/judge/calibration.py" = ["PLC0415"]
+# Observability adapter imports langfuse lazily to avoid hard-dep at module load.
+"src/codex_atlas/observability/langfuse.py" = ["PLC0415"]
+# RAGAS package uses lazy imports for the optional ragas library and datasets.
+# BLE001: broad-except in library wrapper is intentional — any ragas/datasets error falls back.
+"src/codex_atlas/eval/ragas/library.py" = ["PLC0415", "BLE001"]
+"src/codex_atlas/eval/ragas/factory.py" = ["PLC0415"]
+# RAGAS tests use lib_mod import inside methods for monkey-patching.
+"tests/test_ragas.py" = ["PLC0415"]
 
 [tool.ruff.format]
 docstring-code-format = true
@@ -86,7 +113,7 @@ docstring-code-format = true
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src"]
+files = ["src", "examples"]
 ignore_missing_imports = true
 disallow_untyped_decorators = false
 

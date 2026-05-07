@@ -123,10 +123,12 @@ class TestReflection:
 
 
 class TestDefaults:
-    async def test_heuristic_grader_returns_zero(self) -> None:
-        # The default grader returns 0; the agent's per-route confidence
-        # floor is what makes non-empty retrievals pass the threshold.
-        assert await HeuristicGrader().grade("q", [_stored("m.x")]) == 0.0
+    async def test_heuristic_grader_zero_for_empty_one_for_present(self) -> None:
+        # Per docstring: empty retrieval → 0.0, non-empty → 1.0. The
+        # _grade node combines this with retrieval.confidence via max().
+        grader = HeuristicGrader()
+        assert await grader.grade("q", []) == 0.0
+        assert await grader.grade("q", [_stored("m.x")]) == 1.0
 
     async def test_noop_rewriter_appends_clarifier(self) -> None:
         rewriter = NoopRewriter()

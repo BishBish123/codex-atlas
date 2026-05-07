@@ -1,0 +1,46 @@
+# Version-control metadata
+.git/
+.gitignore
+
+# Python caches and virtual-environment
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Test and eval directories — not needed at runtime
+tests/
+evals/
+
+# Developer documentation
+docs/
+examples/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files — secrets must be set via `fly secrets`, never baked in
+.env
+.env.*
+
+# Data snapshots — mount or index in-container rather than baking into image
+# (data/ is left OUT of this list intentionally: the default memory store
+# reads data/chunks.json and data/graph.json at runtime, so a pre-baked
+# snapshot is useful for single-user / demo deployments. For multi-user
+# production, mount a shared volume or use the pgvector + Neo4j backends.)

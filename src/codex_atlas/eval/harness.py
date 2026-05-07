@@ -34,6 +34,8 @@ from pathlib import Path
 import numpy as np
 
 from codex_atlas.agent import Agent, AgentResult
+from codex_atlas.eval.ragas.protocol import RagasMetric
+from codex_atlas.judge.protocol import JudgeProtocol
 from codex_atlas.retriever import Route
 
 
@@ -100,6 +102,13 @@ class EvalResult:
     cost_estimate_usd: float = 0.0
     failure_bucket: FailureBucket = FailureBucket.NONE
     answer_full: str = ""
+    faithfulness: float = -1.0  # -1.0 means "not scored"
+    faithfulness_rationale: str = ""
+    # RAGAS metric scores — -1.0 means "not computed"
+    ragas_faithfulness: float = -1.0
+    ragas_answer_relevancy: float = -1.0
+    ragas_context_precision: float = -1.0
+    ragas_context_recall: float = -1.0
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +124,12 @@ def score_result(
     price_input: float = DEFAULT_PRICE_USD_PER_1K_INPUT,
     price_output: float = DEFAULT_PRICE_USD_PER_1K_OUTPUT,
     indexed_qnames: frozenset[str] | None = None,
+    faithfulness: float = -1.0,
+    faithfulness_rationale: str = "",
+    ragas_faithfulness: float = -1.0,
+    ragas_answer_relevancy: float = -1.0,
+    ragas_context_precision: float = -1.0,
+    ragas_context_recall: float = -1.0,
 ) -> EvalResult:
     cited = [c.qualified_name for c in agent_result.citations]
 
@@ -172,6 +187,12 @@ def score_result(
         cost_estimate_usd=cost,
         failure_bucket=bucket,
         answer_full=agent_result.answer,
+        faithfulness=faithfulness,
+        faithfulness_rationale=faithfulness_rationale,
+        ragas_faithfulness=ragas_faithfulness,
+        ragas_answer_relevancy=ragas_answer_relevancy,
+        ragas_context_precision=ragas_context_precision,
+        ragas_context_recall=ragas_context_recall,
     )
 
 
@@ -278,6 +299,8 @@ async def run_eval(
     questions: list[EvalQuestion],
     *,
     indexed_qnames: frozenset[str] | None = None,
+    judge: JudgeProtocol | None = None,
+    ragas_metrics: list[RagasMetric] | None = None,
 ) -> list[EvalResult]:
     """Run every question through the agent and score the results.
 
@@ -285,13 +308,67 @@ async def run_eval(
     index. When provided, scoring distinguishes ``MISSING_NODE``
     (gold qname doesn't exist in the index) from ``UNGROUNDED`` (agent
     failed to surface an existing qname).
+
+    ``judge`` is an optional :class:`~codex_atlas.judge.protocol.JudgeProtocol`
+    instance. When provided, each answer is scored for answer-level
+    faithfulness and the result is stored in ``EvalResult.faithfulness``.
+    Pass ``None`` to skip faithfulness scoring (the field defaults to
+    ``-1.0``).
+
+    ``ragas_metrics`` is an optional list of
+    :class:`~codex_atlas.eval.ragas.protocol.RagasMetric` objects.
+    When provided, all four RAGAS metric scores are computed per question
+    and stored in the ``EvalResult``.  Pass ``None`` to skip (fields
+    default to ``-1.0``).
     """
     out: list[EvalResult] = []
     for q in questions:
         t0 = time.perf_counter()
         result = await agent.run(q.question)
         latency = (time.perf_counter() - t0) * 1000.0
-        out.append(score_result(q, result, latency, indexed_qnames=indexed_qnames))
+
+        faithfulness = -1.0
+        faithfulness_rationale = ""
+        if judge is not None:
+            cited = [c.qualified_name for c in result.citations]
+            js = await judge.score(
+                question=q.question,
+                expected_qualified_names=q.gold_qualified_names,
+                answer=result.answer,
+                citations=cited,
+            )
+            faithfulness = js.score
+            faithfulness_rationale = js.rationale
+
+        ragas_scores: dict[str, float] = {}
+        if ragas_metrics:
+            # Build context list from chunk texts (available via citations).
+            # The harness doesn't have direct access to chunk texts at this
+            # point, so we use the qualified names as a proxy context — each
+            # qname is a meaningful unit of context for lexical metrics.
+            contexts = [c.qualified_name for c in result.citations]
+            for rm in ragas_metrics:
+                ragas_scores[rm.name] = await rm.compute(
+                    question=q.question,
+                    contexts=contexts,
+                    answer=result.answer,
+                    ground_truth=q.gold_qualified_names,
+                )
+
+        out.append(
+            score_result(
+                q,
+                result,
+                latency,
+                indexed_qnames=indexed_qnames,
+                faithfulness=faithfulness,
+                faithfulness_rationale=faithfulness_rationale,
+                ragas_faithfulness=ragas_scores.get("faithfulness", -1.0),
+                ragas_answer_relevancy=ragas_scores.get("answer_relevancy", -1.0),
+                ragas_context_precision=ragas_scores.get("context_precision", -1.0),
+                ragas_context_recall=ragas_scores.get("context_recall", -1.0),
+            )
+        )
     return out
 
 
@@ -322,16 +399,33 @@ def aggregate(results: list[EvalResult]) -> dict[str, float | int]:
         p95 = float(np.percentile(latencies_arr, 95))
         p99 = float(np.percentile(latencies_arr, 99))
     p50 = float(np.percentile(latencies_arr, 50))
+
+    # Faithfulness: only average over questions that were scored (score >= 0).
+    scored = [r for r in results if r.faithfulness >= 0.0]
+    faithfulness_mean: float = (
+        sum(r.faithfulness for r in scored) / len(scored) if scored else -1.0
+    )
+
+    # RAGAS metrics: average only over questions that were scored (score >= 0).
+    def _ragas_mean(attr: str) -> float:
+        vals = [getattr(r, attr) for r in results if getattr(r, attr) >= 0.0]
+        return sum(vals) / len(vals) if vals else -1.0
+
     return {
         "n": n,
         "route_correctness": sum(1 for r in results if r.route_correct) / n,
         "citation_recall_mean": sum(r.citation_recall for r in results) / n,
         "citation_precision_mean": sum(r.citation_precision for r in results) / n,
+        "faithfulness_mean": faithfulness_mean,
         "latency_p50_ms": p50,
         "latency_p95_ms": p95,
         "latency_p99_ms": p99,
         "tool_call_count_mean": sum(r.tool_call_count for r in results) / n,
         "cost_estimate_usd_total": sum(r.cost_estimate_usd for r in results),
+        "ragas_faithfulness_mean": _ragas_mean("ragas_faithfulness"),
+        "ragas_answer_relevancy_mean": _ragas_mean("ragas_answer_relevancy"),
+        "ragas_context_precision_mean": _ragas_mean("ragas_context_precision"),
+        "ragas_context_recall_mean": _ragas_mean("ragas_context_recall"),
     }
 
 
@@ -356,6 +450,15 @@ def render_report(results: list[EvalResult]) -> str:
 
     agg = aggregate(results)
     n = len(results)
+    faithfulness_mean = float(agg["faithfulness_mean"])
+    faithfulness_display = (
+        f"{faithfulness_mean:.2f}" if faithfulness_mean >= 0.0 else "n/a (no judge)"
+    )
+
+    def _ragas_display(key: str) -> str:
+        v = float(agg.get(key, -1.0))
+        return f"{v:.2f}" if v >= 0.0 else "n/a"
+
     lines = ["# Codex-Atlas eval report", ""]
     lines += [
         "## Headline",
@@ -366,6 +469,11 @@ def render_report(results: list[EvalResult]) -> str:
         f"| Route correctness | {agg['route_correctness']:.1%} |",
         f"| Citation recall (mean) | {agg['citation_recall_mean']:.2f} |",
         f"| Citation precision (mean) | {agg['citation_precision_mean']:.2f} |",
+        f"| Faithfulness (mean) | {faithfulness_display} |",
+        f"| Faithfulness (RAGAS) | {_ragas_display('ragas_faithfulness_mean')} |",
+        f"| Answer relevancy (RAGAS) | {_ragas_display('ragas_answer_relevancy_mean')} |",
+        f"| Context precision (RAGAS) | {_ragas_display('ragas_context_precision_mean')} |",
+        f"| Context recall (RAGAS) | {_ragas_display('ragas_context_recall_mean')} |",
         f"| p50 latency (ms) | {agg['latency_p50_ms']:.1f} |",
         f"| p95 latency (ms) | {agg['latency_p95_ms']:.1f} |",
         f"| p99 latency (ms) | {agg['latency_p99_ms']:.1f} |",
@@ -407,14 +515,15 @@ def render_report(results: list[EvalResult]) -> str:
 
     lines += ["## Per question", ""]
     lines += [
-        "| qid | route ok | recall | prec | ms | tools | bucket | preview |",
-        "| --- | :---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| qid | route ok | recall | prec | faith | ms | tools | bucket | preview |",
+        "| --- | :---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
     for r in results:
         check = "yes" if r.route_correct else "no"
+        faith_str = f"{r.faithfulness:.2f}" if r.faithfulness >= 0.0 else "-"
         lines.append(
             f"| {r.qid} | {check} | {r.citation_recall:.2f} | "
-            f"{r.citation_precision:.2f} | {r.latency_ms:.1f} | "
+            f"{r.citation_precision:.2f} | {faith_str} | {r.latency_ms:.1f} | "
             f"{r.tool_call_count} | {r.failure_bucket} | {r.answer_preview[:80]} |"
         )
 

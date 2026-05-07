@@ -17,6 +17,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
+from codex_atlas import make_agent
 from codex_atlas.agent import Agent
 from codex_atlas.embed import Encoder, FakeEncoder
 from codex_atlas.eval.golden import load_golden_set
@@ -29,6 +30,7 @@ from codex_atlas.eval.harness import (
 )
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.indexer.walker import parse_corpus
+from codex_atlas.judge.factory import make_judge
 from codex_atlas.retriever import Retriever, RetrieverConfig, Route
 from codex_atlas.store import ChunkStore, ChunkStoreProtocol, InMemoryChunkStore
 
@@ -99,9 +101,15 @@ def _command_wrapper() -> Iterator[None]:
 
 
 def _resolve_encoder(name: str) -> Encoder:
+    if not name or not name.strip():
+        _bail(
+            "encoder name must not be empty. "
+            "Use `fake` for the deterministic encoder or a sentence-transformers "
+            "model id (e.g. BAAI/bge-small-en-v1.5)."
+        )
     if name == "fake":
         return FakeEncoder(dim=32)
-    from codex_atlas.embed import load_sentence_transformer_encoder  # noqa: PLC0415
+    from codex_atlas.embed import load_sentence_transformer_encoder
 
     return load_sentence_transformer_encoder(model_name=name)
 
@@ -171,7 +179,7 @@ async def _open_query_store(
 
 
 @app.command()
-def index(
+def index(  # noqa: PLR0915
     corpus: Path = typer.Argument(..., help="Directory to index."),
     graph_out: Path = typer.Option(
         Path("data/graph.json"), help="Where to persist the call graph."
@@ -204,6 +212,15 @@ def index(
         "--chunks-out",
         help="Where to persist the in-memory chunk snapshot when --store=memory.",
     ),
+    graph_backend: str = typer.Option(
+        "networkx",
+        "--graph-backend",
+        help=(
+            "Call-graph backend: `networkx` (default; in-memory) or "
+            "`neo4j` (async Neo4j driver; reads ATLAS_NEO4J_URI, "
+            "ATLAS_NEO4J_USERNAME, ATLAS_NEO4J_PASSWORD)."
+        ),
+    ),
 ) -> None:
     """Walk `corpus`, parse every .py, embed every chunk, persist the graph."""
     # Reject non-directory corpus paths up front: passing a single .py
@@ -220,7 +237,7 @@ def index(
             param_hint="CORPUS",
         )
 
-    async def _run() -> None:  # noqa: PLR0912
+    async def _run() -> None:  # noqa: PLR0912, PLR0915
         encoder_obj = _resolve_encoder(encoder)
         if output_format == "rich":
             console.print(f"[green]parsing[/] {corpus}")
@@ -239,8 +256,41 @@ def index(
         if output_format == "rich":
             console.print(f"[green]parsed[/] {len(parsed)} files")
 
-        graph = CallGraph()
-        graph.ingest(parsed)
+        # Validate graph-backend choice before any expensive work.
+        if graph_backend not in {"networkx", "neo4j"}:
+            _bail(
+                f"unknown --graph-backend value {graph_backend!r} "
+                f"(expected: networkx, neo4j)"
+            )
+
+        if graph_backend == "neo4j":
+            # Neo4j path: stream symbols/edges into Neo4j; also save a
+            # local graph.json for the query commands that still use CallGraph.load().
+            os.environ["ATLAS_GRAPH_BACKEND"] = "neo4j"
+            from codex_atlas.indexer import make_call_graph
+            from codex_atlas.indexer.neo4j_graph import Neo4jCallGraph
+
+            neo4j_graph = make_call_graph()
+            assert isinstance(neo4j_graph, Neo4jCallGraph)
+            await neo4j_graph.setup()
+            await neo4j_graph.clear()
+            local_graph = CallGraph()
+            local_graph.ingest(parsed)
+            for node, data in local_graph._g.nodes(data=True):
+                await neo4j_graph.add_symbol(
+                    node,
+                    str(data.get("file_path", "")),
+                    str(data.get("kind", "")),
+                )
+            for u, v, edge_data in local_graph._g.edges(data=True):
+                kind = str(edge_data.get("kind", ""))
+                if kind in {"calls", "imports"}:
+                    await neo4j_graph.add_edge(u, v, kind)
+            await neo4j_graph.close()
+            graph = local_graph
+        else:
+            graph = CallGraph()
+            graph.ingest(parsed)
         graph.save(graph_out)
         if output_format == "rich":
             console.print(
@@ -336,6 +386,12 @@ def ask(
         "--chunks",
         help="Path to the chunk snapshot when --store=memory.",
     ),
+    backend: str = typer.Option(
+        "hand-rolled",
+        "--backend",
+        help="Agent backend: `hand-rolled` (default) or `langgraph` "
+        "(requires `uv sync --extra real`).",
+    ),
 ) -> None:
     """Run a single agent query end-to-end."""
 
@@ -349,7 +405,7 @@ def ask(
             memory_path=chunks_path,
         )
         retriever = Retriever(encoder_obj, store, cg, RetrieverConfig(top_k=top_k))
-        agent = Agent(retriever)
+        agent = make_agent(retriever, backend=backend)
         result = await agent.run(question)
         console.print(
             f"[bold]Route:[/] {result.route} (grade {result.grade:.2f}, attempts {result.attempts})"
@@ -535,8 +591,8 @@ def mcp(
     os.environ["ATLAS_STORE"] = store_backend
     os.environ["ATLAS_CHUNKS_PATH"] = str(chunks_path)
 
-    from codex_atlas.mcp_server import mcp as mcp_app  # noqa: PLC0415
-    from codex_atlas.mcp_server import validate_startup_config  # noqa: PLC0415
+    from codex_atlas.mcp_server import mcp as mcp_app
+    from codex_atlas.mcp_server import validate_startup_config
 
     with _command_wrapper():
         # Fail-fast on bad startup config and map the error to exit 2,
@@ -626,6 +682,27 @@ def eval_cmd(  # noqa: PLR0915
         "--rebuild-graph",
         help="Parse `--corpus` and write `--graph` from scratch before evaluating.",
     ),
+    judge_mode: str = typer.Option(
+        "auto",
+        "--judge",
+        help=(
+            "Answer-faithfulness judge mode: "
+            "`auto` (LLMJudge when env key present, else HeuristicJudge), "
+            "`llm` (always LLM; raises if no key), "
+            "`heuristic` (always deterministic, no LLM)."
+        ),
+    ),
+    metrics: str = typer.Option(
+        "custom,ragas",
+        "--metrics",
+        help=(
+            "Comma-separated list of metric groups to compute. "
+            "`custom` = existing harness metrics (route correctness, citations, faithfulness). "
+            "`ragas` = add RAGAS-style metrics (faithfulness, answer_relevancy, "
+            "context_precision, context_recall). "
+            "Default: `custom,ragas`. Use `custom` alone to skip RAGAS for speed."
+        ),
+    ),
 ) -> None:
     """Run the golden test set and write a markdown + (optional) JSON report."""
     # Validate `--corpus` BEFORE we resolve the encoder. For any
@@ -682,7 +759,29 @@ def eval_cmd(  # noqa: PLR0915
         retriever = Retriever(encoder_obj, store, cg, RetrieverConfig(top_k=8))
         agent = Agent(retriever)
         questions = load_golden_set()
-        results = await run_eval(agent, questions)
+        try:
+            active_judge = make_judge(mode=judge_mode)
+        except OSError as exc:
+            _bail(
+                f"--judge {judge_mode!r} requires an API key. "
+                f"Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or use --judge heuristic. "
+                f"({exc})",
+                exc,
+            )
+        # Parse --metrics flag
+        requested_metrics = {m.strip() for m in metrics.split(",") if m.strip()}
+        active_ragas_metrics = None
+        if "ragas" in requested_metrics:
+            from codex_atlas.eval.ragas.factory import make_ragas_metrics
+
+            active_ragas_metrics = make_ragas_metrics()
+
+        results = await run_eval(
+            agent,
+            questions,
+            judge=active_judge,
+            ragas_metrics=active_ragas_metrics,
+        )
         report = render_report(results)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(report)
@@ -759,3 +858,32 @@ def eval_cmd(  # noqa: PLR0915
         if needs_corpus:
             parsed_corpus_holder.append(_require_corpus_dir_and_parse(corpus))
         asyncio.run(_run())
+
+
+@app.command(name="calibrate")
+def calibrate_cmd(
+    labels: Path = typer.Option(
+        Path("evals/calibration.csv"),
+        "--labels",
+        help="Path to the human-labelled calibration CSV.",
+    ),
+    out: Path = typer.Option(
+        Path("evals/CALIBRATION.md"),
+        "--out",
+        help="Where to write the CALIBRATION.md report.",
+    ),
+    judge_mode: str = typer.Option(
+        "auto",
+        "--judge",
+        help="Judge mode: `auto`, `llm`, or `heuristic`.",
+    ),
+) -> None:
+    """Run Cohen's kappa calibration between the judge and human labels."""
+    from codex_atlas.judge.calibration import calibration_cli_main
+
+    with _command_wrapper():
+        calibration_cli_main(
+            csv_path=labels,
+            out_path=out,
+            judge_mode=judge_mode,
+        )

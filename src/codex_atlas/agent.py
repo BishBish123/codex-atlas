@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal, Protocol, TypeVar
 
+from codex_atlas.observability.langfuse import LangfuseTracer, NullTracer, make_tracer
 from codex_atlas.retriever import RetrievalResult, Retriever, Route
 from codex_atlas.store import StoredChunk
 
@@ -291,7 +292,7 @@ class HeuristicGrader:
     """
 
     async def grade(self, query: str, chunks: list[StoredChunk]) -> float:
-        return 0.0
+        return 1.0 if chunks else 0.0
 
 
 @dataclass(frozen=True)
@@ -563,13 +564,20 @@ class Agent:
         rewriter: QueryRewriter | None = None,
         validator: Validator | None = None,
         config: AgentConfig | None = None,
+        tracer: LangfuseTracer | NullTracer | None = None,
     ) -> None:
         self._retriever = retriever
-        self._synth = synthesizer or StitchSynthesizer()
+        if synthesizer is not None:
+            self._synth = synthesizer
+        else:
+            from codex_atlas.synthesis import make_synthesizer  # noqa: PLC0415
+
+            self._synth = make_synthesizer()
         self._grader = grader or HeuristicGrader()
         self._rewriter = rewriter or NoopRewriter()
         self._validator = validator or CitationValidator()
         self._config = config or AgentConfig()
+        self._tracer: LangfuseTracer | NullTracer = tracer if tracer is not None else make_tracer()
 
     async def run(self, query: str, *, route_override: Route | None = None) -> AgentResult:
         """Run the state machine; optionally skip the classifier.
@@ -580,9 +588,17 @@ class Agent:
         """
         run_t0 = time.perf_counter()
         state = _State(original_query=query, query=query, route_override=route_override)
+        trace_id = self._tracer.start_run(query)
         try:
             await self._with_run_deadline(self._retrieve(state), run_t0)
+            # Emit the two trace events + tool call added by _retrieve.
+            for ev in state.trace[-2:]:
+                self._tracer.record_event(trace_id, ev)
+            if state.tool_calls:
+                self._tracer.record_event(trace_id, state.tool_calls[-1])
+
             await self._with_run_deadline(self._grade(state), run_t0)
+            self._tracer.record_event(trace_id, state.trace[-1])
 
             while (
                 state.cancelled is None
@@ -590,14 +606,26 @@ class Agent:
                 and state.attempts < self._config.max_attempts - 1
             ):
                 await self._with_run_deadline(self._rewrite(state), run_t0)
+                self._tracer.record_event(trace_id, state.trace[-1])
+
                 await self._with_run_deadline(self._retrieve(state), run_t0)
+                for ev in state.trace[-2:]:
+                    self._tracer.record_event(trace_id, ev)
+                if state.tool_calls:
+                    self._tracer.record_event(trace_id, state.tool_calls[-1])
+
                 await self._with_run_deadline(self._grade(state), run_t0)
+                self._tracer.record_event(trace_id, state.trace[-1])
 
             if state.cancelled is None:
                 answer, citations = await self._with_run_deadline(self._answer(state), run_t0)
+                self._tracer.record_event(trace_id, state.trace[-1])
+
                 validation = await self._with_run_deadline(
                     self._validate(state, answer, citations), run_t0
                 )
+                self._tracer.record_event(trace_id, state.trace[-1])
+                self._tracer.record_validation(trace_id, validation)
                 # Enforce the configured policy when validation rejects.
                 # ``_apply_validation`` is a pure transform — the original
                 # report is preserved on the result so callers can still
@@ -615,6 +643,7 @@ class Agent:
                     detail=f"reason={exc.reason}",
                 )
             )
+            self._tracer.record_event(trace_id, state.trace[-1])
             answer, citations, validation = ("", [], None)
 
         # Surface the timed-out node only when the cancellation was
@@ -626,7 +655,7 @@ class Agent:
             if state.cancelled is CancelReason.TIMEOUT
             else None
         )
-        return AgentResult(
+        result = AgentResult(
             query=state.original_query,
             final_query=state.query,
             answer=answer,
@@ -640,6 +669,8 @@ class Agent:
             cancelled=state.cancelled,
             cancelled_node=cancelled_node,
         )
+        self._tracer.finish_run(trace_id, result)
+        return result
 
     async def _with_run_deadline(self, coro: Coroutine[Any, Any, T], run_t0: float) -> T:
         """Wrap a coro in the optional whole-run timeout.

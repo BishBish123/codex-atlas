@@ -1,0 +1,42 @@
+version: "3.9"
+
+# Local Neo4j Community for development.
+#
+# Usage:
+#   make neo4j-up    # Start the container in the background
+#   make neo4j-down  # Stop and remove the container + volume
+#
+# Connection string (export before running atlas with --graph-backend neo4j):
+#   export ATLAS_NEO4J_URI=bolt://localhost:7687
+#   export ATLAS_NEO4J_USERNAME=neo4j
+#   export ATLAS_NEO4J_PASSWORD=neo4j-dev
+#
+# Neo4j Browser is available at http://localhost:7474 (same credentials).
+# The bolt port is 7687 (standard); no clash with pgvector on 5433.
+
+services:
+  neo4j:
+    image: neo4j:5.20-community
+    container_name: codex_atlas_neo4j
+    environment:
+      NEO4J_AUTH: neo4j/neo4j-dev
+      # Disable anonymous usage metrics
+      NEO4J_dbms_usage__report_enabled: "false"
+    ports:
+      - "7474:7474"  # HTTP Browser
+      - "7687:7687"  # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "wget -qO- http://localhost:7474 || exit 1"
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  neo4j_data:
+  neo4j_logs:

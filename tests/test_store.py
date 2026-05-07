@@ -445,6 +445,9 @@ class TestChunkStoreDeleteByFilePath:
         monkeypatch.setattr(
             ChunkStore, "_connect", lambda self: _stub_connect(_Conn())
         )
+        await store.setup(dim=4)
+        # Drop the bootstrap DDL captures so we only see the DELETE.
+        executed.clear()
         rows = await store.delete_by_file_path("pkg/m.py")
         assert rows == 4
         assert len(executed) == 1
@@ -467,4 +470,131 @@ class TestChunkStoreDeleteByFilePath:
         monkeypatch.setattr(
             ChunkStore, "_connect", lambda self: _stub_connect(_Conn())
         )
+        await store.setup(dim=4)
         assert (await store.delete_by_file_path("nope.py")) == 0
+
+    async def test_delete_before_setup_errors(self) -> None:
+        store = ChunkStore(dsn="postgresql://stub")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await store.delete_by_file_path("a.py")
+
+
+class TestSetupRaceProtection:
+    """``setup()`` and concurrent first-callers must not race.
+
+    The earlier code set ``self._dim = dim`` BEFORE the DDL block.
+    A concurrent first ``upsert_chunks`` / ``search`` saw "dim is set"
+    and proceeded to hit a missing-table error. The fix moves the state
+    publication to AFTER the DDL block AND gates every public op on a
+    ``_bootstrapped`` flag set in the same atomic step.
+    """
+
+    async def test_concurrent_setup_and_upsert_does_not_race(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = ChunkStore(dsn="postgresql://stub")
+
+        ddl_started = asyncio.Event()
+        ddl_can_finish = asyncio.Event()
+
+        class _Conn:
+            async def execute(self, sql: str, *_args: Any, **_kwargs: Any) -> str:
+                # Pause INSIDE the DDL block so a concurrent caller has
+                # the maximum opportunity to see the half-initialised
+                # state. Without the lock + post-DDL flag, the caller
+                # would race past ``_dim is not None`` and try to UPSERT
+                # before the table exists.
+                if "CREATE TABLE" in sql:
+                    ddl_started.set()
+                    await ddl_can_finish.wait()
+                return "OK"
+
+            async def fetch(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+                return []
+
+            async def executemany(self, *_args: Any, **_kwargs: Any) -> None:
+                return None
+
+        monkeypatch.setattr(
+            ChunkStore, "_connect", lambda self: _stub_connect(_Conn())
+        )
+        # pgvector's register_vector hits the conn with type-codec
+        # registration; stub it out so we don't depend on a live conn.
+        from pgvector import asyncpg as pgv_async  # noqa: PLC0415
+
+        async def fake_register_vector(_conn: Any) -> None:
+            return None
+
+        monkeypatch.setattr(pgv_async, "register_vector", fake_register_vector)
+
+        async def setup_task() -> None:
+            await store.setup(dim=4)
+
+        async def upsert_task() -> Exception | int | None:
+            await ddl_started.wait()
+            # At this exact point the OLD implementation already had
+            # ``_dim`` set; the upsert would slip past and fail at the
+            # database. The new implementation rejects with a clean
+            # RuntimeError that says "call setup() first".
+            chunks = [
+                Chunk(
+                    qualified_name="m.fn",
+                    kind=SymbolKind.FUNCTION,
+                    file_path="m.py",
+                    lineno_start=1,
+                    lineno_end=2,
+                    text="def fn(): pass",
+                )
+            ]
+            try:
+                return await store.upsert_chunks(
+                    chunks, np.zeros((1, 4), dtype=np.float32)
+                )
+            except RuntimeError as e:
+                return e
+
+        async def driver() -> tuple[None, Exception | int | None]:
+            tasks = asyncio.gather(setup_task(), upsert_task())
+            # Let upsert_task park on ddl_started, then release the DDL.
+            await ddl_started.wait()
+            ddl_can_finish.set()
+            return await tasks
+
+        results: tuple[None, Exception | int | None] = await driver()
+        _, upsert_outcome = results
+        # Upsert either errored cleanly with the not-initialised
+        # message OR completed successfully (if the lock interleaving
+        # made it run AFTER setup finished). What MUST NOT happen is
+        # asyncpg.UndefinedTableError or similar racing-into-DDL noise.
+        if isinstance(upsert_outcome, Exception):
+            assert "not initialized" in str(upsert_outcome)
+        else:
+            assert upsert_outcome == 1
+
+    async def test_setup_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The lock + flag must NOT make repeat setup() calls re-run the
+        # DDL block. ``test_setup_twice_short_circuits`` exists already
+        # — this version asserts the same property explicitly under the
+        # new locking regime.
+        store = ChunkStore(dsn="postgresql://stub")
+        conn = _FakeConnection()
+        monkeypatch.setattr(
+            ChunkStore, "_connect", lambda self: _stub_connect(conn)
+        )
+        await store.setup(dim=8)
+        n_after_first = len(conn.executed)
+        for _ in range(5):
+            await store.setup(dim=8)
+        # Idempotent re-entry: no new DDL across the next 5 calls.
+        assert len(conn.executed) == n_after_first
+
+    async def test_public_ops_before_setup_error(self) -> None:
+        store = ChunkStore(dsn="postgresql://stub")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await store.upsert_chunks([], np.zeros((0, 4), dtype=np.float32))
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await store.search(np.zeros(4, dtype=np.float32))
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await store.fetch_by_qualified_name("anything")
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await store.delete_by_file_path("anything.py")

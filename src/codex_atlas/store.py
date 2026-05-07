@@ -98,6 +98,9 @@ class ChunkStore:
         self._pool: asyncpg.Pool | None = None
         # Set once setup() has run successfully; lets repeat callers
         # short-circuit the DDL without skipping pool initialisation.
+        # Public ops (upsert, search, fetch, delete) refuse to run until
+        # this flag is True so a concurrent caller can't slip past a
+        # half-initialised store.
         self._bootstrapped: bool = False
         # Serialises lazy pool creation. Without this, two concurrent
         # ``_connect`` callers can both observe ``_pool is None`` and
@@ -105,6 +108,13 @@ class ChunkStore:
         # assignment and the first one's pool is silently leaked. The
         # double-checked init under the lock fixes the race.
         self._pool_lock: asyncio.Lock = asyncio.Lock()
+        # Serialises bootstrap. The earlier code set ``self._dim`` BEFORE
+        # the DDL block, so a concurrent first upsert/search would see
+        # ``_dim is not None``, proceed, and hit a missing-table error.
+        # All state mutations move INSIDE the locked section, after the
+        # DDL commits, so observers either see "not bootstrapped" (and
+        # raise) or "fully bootstrapped" (and proceed).
+        self._setup_lock: asyncio.Lock = asyncio.Lock()
 
     @asynccontextmanager
     async def _connect(self) -> AsyncIterator[asyncpg.Connection]:
@@ -131,40 +141,65 @@ class ChunkStore:
         ``IF NOT EXISTS``) but still cheap; chronic-path callers (MCP /
         agent loop) should call this once at process start and reuse
         the store across requests.
+
+        Concurrency: the body runs under ``_setup_lock``. Visible state
+        (``_dim``, ``_bootstrapped``) is set AFTER the DDL block
+        finishes so a concurrent ``upsert_chunks`` / ``search`` either
+        sees "not bootstrapped" and raises (rather than racing into a
+        missing-table error) or sees a fully-initialised store.
         """
         if dim <= 0:
             raise ValueError("dim must be positive")
-        if self._bootstrapped and not drop_existing and self._dim == dim:
-            return
-        self._dim = dim
-        async with self._connect() as conn:
-            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            if drop_existing:
-                await conn.execute(f'DROP TABLE IF EXISTS "{self._table}"')
-            await conn.execute(
-                f'CREATE TABLE IF NOT EXISTS "{self._table}" ('
-                "id text PRIMARY KEY,"
-                "qualified_name text NOT NULL,"
-                "file_path text NOT NULL,"
-                "lineno_start int NOT NULL,"
-                "lineno_end int NOT NULL,"
-                "kind text NOT NULL,"
-                "text text NOT NULL,"
-                f"vec vector({dim}) NOT NULL"
-                ")"
-            )
-            await conn.execute(
-                f'CREATE INDEX IF NOT EXISTS "{self._table}_qname_idx" '
-                f'ON "{self._table}" (qualified_name)'
-            )
-            # HNSW index — created idempotently. m + ef_construction picked
-            # for the typical 10k-50k chunk range a single-codebase ingest.
-            await conn.execute(
-                f'CREATE INDEX IF NOT EXISTS "{self._table}_vec_idx" '
-                f'ON "{self._table}" USING hnsw (vec vector_cosine_ops) '
-                "WITH (m = 16, ef_construction = 64)"
-            )
-        self._bootstrapped = True
+        async with self._setup_lock:
+            # Idempotent fast path: a previous winning caller already
+            # bootstrapped the store at the same dim. Skip the DDL.
+            if self._bootstrapped and not drop_existing and self._dim == dim:
+                return
+            async with self._connect() as conn:
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                if drop_existing:
+                    await conn.execute(f'DROP TABLE IF EXISTS "{self._table}"')
+                await conn.execute(
+                    f'CREATE TABLE IF NOT EXISTS "{self._table}" ('
+                    "id text PRIMARY KEY,"
+                    "qualified_name text NOT NULL,"
+                    "file_path text NOT NULL,"
+                    "lineno_start int NOT NULL,"
+                    "lineno_end int NOT NULL,"
+                    "kind text NOT NULL,"
+                    "text text NOT NULL,"
+                    f"vec vector({dim}) NOT NULL"
+                    ")"
+                )
+                await conn.execute(
+                    f'CREATE INDEX IF NOT EXISTS "{self._table}_qname_idx" '
+                    f'ON "{self._table}" (qualified_name)'
+                )
+                # HNSW index — created idempotently. m + ef_construction picked
+                # for the typical 10k-50k chunk range a single-codebase ingest.
+                await conn.execute(
+                    f'CREATE INDEX IF NOT EXISTS "{self._table}_vec_idx" '
+                    f'ON "{self._table}" USING hnsw (vec vector_cosine_ops) '
+                    "WITH (m = 16, ef_construction = 64)"
+                )
+            # ONLY after the DDL block commits do we publish "ready" state.
+            # Concurrent observers that lost the lock now see a fully-set-up
+            # store rather than a half-initialised one.
+            self._dim = dim
+            self._bootstrapped = True
+
+    def _require_bootstrapped(self) -> None:
+        """Reject public-op calls that happen before ``setup()`` finishes.
+
+        Concurrent setup + upsert/search used to race: the old code set
+        ``_dim`` BEFORE the DDL block, so a parallel caller saw "dim is
+        set, must be ready" and proceeded to hit a missing-table error.
+        ``_bootstrapped`` flips to True only AFTER the DDL block
+        commits, so this check rejects the early caller cleanly with a
+        message they can act on.
+        """
+        if not self._bootstrapped:
+            raise RuntimeError("ChunkStore not initialized — call setup() first")
 
     async def close(self) -> None:
         """Close the pool. Idempotent — safe to call multiple times."""
@@ -180,8 +215,8 @@ class ChunkStore:
     async def upsert_chunks(
         self, chunks: Sequence[Chunk], vectors: np.ndarray, batch_size: int = 256
     ) -> int:
-        if self._dim is None:
-            raise RuntimeError("upsert_chunks() called before setup()")
+        self._require_bootstrapped()
+        assert self._dim is not None  # narrowed by _require_bootstrapped
         if len(chunks) != vectors.shape[0]:
             raise ValueError(f"chunk/vector length mismatch: {len(chunks)} vs {vectors.shape[0]}")
         if vectors.shape[1] != self._dim:
@@ -230,8 +265,8 @@ class ChunkStore:
             return n_written
 
     async def search(self, query_vec: np.ndarray, k: int = 8) -> list[StoredChunk]:
-        if self._dim is None:
-            raise RuntimeError("search() called before setup()")
+        self._require_bootstrapped()
+        assert self._dim is not None  # narrowed by _require_bootstrapped
         if k <= 0:
             raise ValueError("k must be positive")
         if query_vec.ndim != 1 or query_vec.shape[0] != self._dim:
@@ -265,6 +300,7 @@ class ChunkStore:
         ]
 
     async def fetch_by_qualified_name(self, qualified_name: str) -> StoredChunk | None:
+        self._require_bootstrapped()
         async with self._connect() as conn:
             row = await conn.fetchrow(
                 f"SELECT id, qualified_name, file_path, lineno_start, lineno_end, "
@@ -294,6 +330,7 @@ class ChunkStore:
         or deleted are tombstoned by this DELETE rather than left behind
         as ghost rows.
         """
+        self._require_bootstrapped()
         async with self._connect() as conn:
             tag = await conn.execute(
                 f'DELETE FROM "{self._table}" WHERE file_path = $1',

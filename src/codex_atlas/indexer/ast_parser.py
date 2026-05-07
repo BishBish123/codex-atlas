@@ -55,7 +55,16 @@ class Chunk:
     text: str
 
     def chunk_id(self) -> str:
-        return f"{self.file_path}::{self.qualified_name}::L{self.lineno_start}"
+        # ``chunk_id`` is intentionally stable on (file_path, qualified_name)
+        # — line numbers are NOT part of identity. Earlier versions
+        # encoded ``lineno_start`` here, which meant any line shift
+        # (a top-of-file import, a docstring edit) re-minted a fresh
+        # row instead of UPSERTing the existing one. Reindexes then
+        # accumulated ghost rows for symbols that had merely moved.
+        # The indexer companion-piece — ``cli index`` deletes every
+        # chunk with the file's path before re-inserting — handles the
+        # rename/delete case cleanly under this stable-id scheme.
+        return f"{self.file_path}::{self.qualified_name}"
 
 
 @dataclass(frozen=True)

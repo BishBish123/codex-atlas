@@ -196,6 +196,19 @@ def index(
 
         store = ChunkStore(dsn=_dsn())
         await store.setup(dim=encoder_obj.dim, drop_existing=drop_existing)
+        # Tombstone every chunk row that belongs to a file we just
+        # parsed BEFORE inserting the new chunks. ``Chunk.chunk_id`` is
+        # now stable on (file_path, qualified_name) so symbols that
+        # merely moved keep their row through the UPSERT — but symbols
+        # that were renamed or deleted in this file would otherwise
+        # leave ghost rows that surface during retrieval. Deleting by
+        # file_path first turns reindex into a true idempotent
+        # operation. ``drop_existing=True`` already wipes the whole
+        # table, so the per-file delete is redundant in that mode.
+        if not drop_existing:
+            touched_files = {c.file_path for c in chunks}
+            for fp in touched_files:
+                await store.delete_by_file_path(fp)
         n_written = await store.upsert_chunks(chunks, vectors)
         if output_format == "rich":
             console.print(f"[green]upserted[/] {n_written} chunks into pgvector")

@@ -67,6 +67,8 @@ class ChunkStoreProtocol(Protocol):
 
     async def fetch_by_qualified_name(self, qualified_name: str) -> StoredChunk | None: ...
 
+    async def delete_by_file_path(self, file_path: str) -> int: ...
+
 
 class ChunkStore:
     """Async pgvector adapter for code chunks (pooled connections)."""
@@ -282,6 +284,29 @@ class ChunkStore:
             score=1.0,
         )
 
+    async def delete_by_file_path(self, file_path: str) -> int:
+        """Drop every chunk row owned by ``file_path``. Returns rows deleted.
+
+        Called by the indexer right before re-inserting the chunks for
+        a file. Combined with the now-line-stable ``Chunk.chunk_id`` this
+        guarantees reindex idempotency: symbols that move keep their row
+        (UPSERT updates the lineno fields), and symbols that were renamed
+        or deleted are tombstoned by this DELETE rather than left behind
+        as ghost rows.
+        """
+        async with self._connect() as conn:
+            tag = await conn.execute(
+                f'DELETE FROM "{self._table}" WHERE file_path = $1',
+                file_path,
+            )
+        # asyncpg returns the command tag, e.g. "DELETE 7"; pull out the
+        # row count so callers can report it. Falls back to 0 if the tag
+        # is unexpectedly shaped.
+        try:
+            return int(tag.rsplit(" ", 1)[-1])
+        except (ValueError, AttributeError):
+            return 0
+
 
 class InMemoryChunkStore:
     """Dict-backed chunk store for tests + the eval harness.
@@ -396,3 +421,12 @@ class InMemoryChunkStore:
                 if row.qualified_name == qualified_name:
                     return row
             return None
+
+    async def delete_by_file_path(self, file_path: str) -> int:
+        """In-memory mirror of ``ChunkStore.delete_by_file_path``."""
+        async with self._lock:
+            doomed = [cid for cid, row in self._rows.items() if row.file_path == file_path]
+            for cid in doomed:
+                del self._rows[cid]
+                self._vectors.pop(cid, None)
+            return len(doomed)

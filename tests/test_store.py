@@ -278,3 +278,193 @@ class TestInMemoryChunkStoreRoundTrip:
                 assert (
                     await store.fetch_by_qualified_name(f"m.batch_{batch}_{i}")
                 ) is not None
+
+
+class TestChunkIdStability:
+    """``Chunk.chunk_id`` must be stable on (file_path, qualified_name).
+
+    The earlier scheme keyed on ``lineno_start`` too, which meant any
+    line shift (a new import, a docstring tweak) re-minted a fresh row
+    instead of UPSERTing the existing one. Ghost rows piled up across
+    reindexes; retrieval surfaced them. The fix drops lineno from the
+    identity, so the same symbol at a different line keeps the same id.
+    """
+
+    def test_chunk_id_stable_under_line_shift(self) -> None:
+        a = Chunk(
+            qualified_name="pkg.m.fn",
+            kind=SymbolKind.FUNCTION,
+            file_path="pkg/m.py",
+            lineno_start=10,
+            lineno_end=12,
+            text="def fn(): pass",
+        )
+        b = Chunk(
+            qualified_name="pkg.m.fn",
+            kind=SymbolKind.FUNCTION,
+            file_path="pkg/m.py",
+            lineno_start=42,  # symbol moved (new import added above it)
+            lineno_end=44,
+            text="def fn(): pass",
+        )
+        assert a.chunk_id() == b.chunk_id()
+
+    def test_chunk_id_distinct_per_file(self) -> None:
+        # Same qname in two different files is a real conflict-of-name
+        # situation that the store must keep separate.
+        a = Chunk(
+            qualified_name="pkg.helper",
+            kind=SymbolKind.FUNCTION,
+            file_path="pkg/a.py",
+            lineno_start=1,
+            lineno_end=2,
+            text="def helper(): pass",
+        )
+        b = Chunk(
+            qualified_name="pkg.helper",
+            kind=SymbolKind.FUNCTION,
+            file_path="pkg/b.py",
+            lineno_start=1,
+            lineno_end=2,
+            text="def helper(): pass",
+        )
+        assert a.chunk_id() != b.chunk_id()
+
+
+class TestReindexReplacesChunks:
+    """`InMemoryChunkStore.delete_by_file_path` + UPSERT == idempotent reindex.
+
+    The stable-id scheme alone isn't enough: when a symbol is renamed
+    or removed the OLD chunk_id never collides with anything on the
+    next pass. We delete-by-file before reinserting so renames /
+    deletions tombstone cleanly.
+    """
+
+    async def test_reindex_replaces_chunks_for_changed_file(self) -> None:
+        store = InMemoryChunkStore()
+        await store.setup(dim=4)
+        # v1: three symbols in m.py.
+        v1 = [
+            Chunk(
+                qualified_name=f"m.{name}",
+                kind=SymbolKind.FUNCTION,
+                file_path="m.py",
+                lineno_start=i + 1,
+                lineno_end=i + 2,
+                text=f"def {name}(): pass",
+            )
+            for i, name in enumerate(("alpha", "beta", "gamma"))
+        ]
+        await store.upsert_chunks(v1, np.ones((3, 4), dtype=np.float32))
+        for name in ("alpha", "beta", "gamma"):
+            assert (await store.fetch_by_qualified_name(f"m.{name}")) is not None
+        # v2: ``beta`` was removed, ``gamma`` was renamed to ``delta``,
+        # ``alpha`` shifted down a few lines.
+        v2 = [
+            Chunk(
+                qualified_name="m.alpha",
+                kind=SymbolKind.FUNCTION,
+                file_path="m.py",
+                lineno_start=20,
+                lineno_end=21,
+                text="def alpha(): pass",
+            ),
+            Chunk(
+                qualified_name="m.delta",
+                kind=SymbolKind.FUNCTION,
+                file_path="m.py",
+                lineno_start=30,
+                lineno_end=31,
+                text="def delta(): pass",
+            ),
+        ]
+        # Mirror the cli's reindex sequence: delete by file, then upsert.
+        n_deleted = await store.delete_by_file_path("m.py")
+        assert n_deleted == 3
+        await store.upsert_chunks(v2, np.ones((2, 4), dtype=np.float32))
+        # alpha + delta survive; beta + gamma are tombstoned.
+        assert (await store.fetch_by_qualified_name("m.alpha")) is not None
+        assert (await store.fetch_by_qualified_name("m.delta")) is not None
+        assert (await store.fetch_by_qualified_name("m.beta")) is None
+        assert (await store.fetch_by_qualified_name("m.gamma")) is None
+        # alpha's stored lineno reflects the new position — the row was
+        # updated in place, not re-minted as a duplicate.
+        alpha = await store.fetch_by_qualified_name("m.alpha")
+        assert alpha is not None and alpha.lineno_start == 20
+
+    async def test_delete_by_file_path_only_touches_named_file(self) -> None:
+        # A file's delete must NOT take other files' rows with it.
+        store = InMemoryChunkStore()
+        await store.setup(dim=4)
+        chunks = [
+            Chunk(
+                qualified_name="m.a",
+                kind=SymbolKind.FUNCTION,
+                file_path="a.py",
+                lineno_start=1,
+                lineno_end=2,
+                text="def a(): pass",
+            ),
+            Chunk(
+                qualified_name="m.b",
+                kind=SymbolKind.FUNCTION,
+                file_path="b.py",
+                lineno_start=1,
+                lineno_end=2,
+                text="def b(): pass",
+            ),
+        ]
+        await store.upsert_chunks(chunks, np.ones((2, 4), dtype=np.float32))
+        n = await store.delete_by_file_path("a.py")
+        assert n == 1
+        assert (await store.fetch_by_qualified_name("m.a")) is None
+        assert (await store.fetch_by_qualified_name("m.b")) is not None
+
+
+class TestChunkStoreDeleteByFilePath:
+    """`ChunkStore.delete_by_file_path` issues a single parameterised DELETE.
+
+    The DELETE hits the live pgvector table at integration time; we
+    verify the SQL shape and the command-tag parsing here so the unit
+    suite can lock down regressions without a Postgres dependency.
+    """
+
+    async def test_delete_by_file_path_issues_parameterised_delete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = ChunkStore(dsn="postgresql://stub", table="chunks_test")
+
+        executed: list[tuple[str, tuple[Any, ...]]] = []
+
+        class _Conn:
+            async def execute(self, sql: str, *args: Any, **_kwargs: Any) -> str:
+                executed.append((sql, args))
+                # Mimic asyncpg's command tag for DELETE.
+                return "DELETE 4"
+
+        monkeypatch.setattr(
+            ChunkStore, "_connect", lambda self: _stub_connect(_Conn())
+        )
+        rows = await store.delete_by_file_path("pkg/m.py")
+        assert rows == 4
+        assert len(executed) == 1
+        sql, args = executed[0]
+        # The file_path is parameterised — no string interpolation of
+        # caller-controlled values.
+        assert "DELETE FROM" in sql
+        assert "WHERE file_path = $1" in sql
+        assert args == ("pkg/m.py",)
+
+    async def test_delete_by_file_path_handles_zero_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = ChunkStore(dsn="postgresql://stub", table="chunks_test")
+
+        class _Conn:
+            async def execute(self, *_args: Any, **_kwargs: Any) -> str:
+                return "DELETE 0"
+
+        monkeypatch.setattr(
+            ChunkStore, "_connect", lambda self: _stub_connect(_Conn())
+        )
+        assert (await store.delete_by_file_path("nope.py")) == 0

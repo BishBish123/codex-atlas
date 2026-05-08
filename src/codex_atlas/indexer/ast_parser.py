@@ -389,10 +389,26 @@ def _collect_type_aliases(tree: ast.AST, *, file_path: str, module_name: str) ->
             )
             continue
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            # `X: TypeAlias = Y` (PEP 613) — accept if annotation is a
-            # bare `TypeAlias` or `typing.TypeAlias` reference.
-            ann = ast.unparse(node.annotation) if node.annotation is not None else ""
-            if ann.endswith("TypeAlias") and node.value is not None:
+            # `X: TypeAlias = Y` (PEP 613) — accept ONLY when the
+            # annotation is the bare ``TypeAlias`` name or the
+            # ``typing.TypeAlias`` attribute. The earlier
+            # ``ast.unparse(...).endswith("TypeAlias")`` heuristic
+            # accepted ``NotTypeAlias``, ``pkg.MyTypeAlias``, etc., as
+            # if they were the real PEP 613 sentinel. AST-shape match
+            # rejects those false positives without paying the cost of
+            # a full type lookup.
+            if node.annotation is None or node.value is None:
+                continue
+            ann = node.annotation
+            is_type_alias = (
+                isinstance(ann, ast.Name) and ann.id == "TypeAlias"
+            ) or (
+                isinstance(ann, ast.Attribute)
+                and isinstance(ann.value, ast.Name)
+                and ann.value.id == "typing"
+                and ann.attr == "TypeAlias"
+            )
+            if is_type_alias:
                 out.append(
                     TypeAlias(
                         qualified_name=f"{module_name}.{node.target.id}",

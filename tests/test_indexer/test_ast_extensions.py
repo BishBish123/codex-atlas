@@ -135,6 +135,37 @@ class TestTypeAliases:
         names = {a.qualified_name for a in pf.type_aliases}
         assert "m.Ids" in names
 
+    def test_type_alias_detected_for_typing_dot_TypeAlias(self, tmp_path: Path) -> None:
+        # ``typing.TypeAlias`` (without ``from typing import``) is the
+        # other PEP 613 spelling. AST-shape match handles both.
+        f = tmp_path / "m.py"
+        f.write_text("import typing\nIds: typing.TypeAlias = list[int]\n")
+        pf = parse_python_file(f, tmp_path)
+        names = {a.qualified_name for a in pf.type_aliases}
+        assert "m.Ids" in names
+
+    def test_type_alias_not_detected_for_NotTypeAlias(self, tmp_path: Path) -> None:
+        # ``NotTypeAlias`` literally ends with the string ``TypeAlias``,
+        # which the old endswith heuristic incorrectly accepted. The
+        # AST-shape check rejects it: ``NotTypeAlias`` is an ast.Name
+        # whose ``id`` is not ``"TypeAlias"``.
+        f = tmp_path / "m.py"
+        f.write_text("class NotTypeAlias: ...\nX: NotTypeAlias = 7\n")
+        pf = parse_python_file(f, tmp_path)
+        names = {a.qualified_name for a in pf.type_aliases}
+        assert "m.X" not in names
+
+    def test_type_alias_not_detected_for_pkg_MyTypeAlias(self, tmp_path: Path) -> None:
+        # ``pkg.MyTypeAlias`` is an ast.Attribute whose ``attr`` is
+        # ``MyTypeAlias`` — also previously accepted by ``endswith``,
+        # also rejected by the shape check (attr must be exactly
+        # "TypeAlias" AND the receiver must be the ``typing`` module).
+        f = tmp_path / "m.py"
+        f.write_text("import pkg\nX: pkg.MyTypeAlias = 7\n")
+        pf = parse_python_file(f, tmp_path)
+        names = {a.qualified_name for a in pf.type_aliases}
+        assert "m.X" not in names
+
 
 class TestImportRefs:
     def test_simple_import(self, tmp_path: Path) -> None:

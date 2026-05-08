@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 from codex_atlas import mcp_server
-from codex_atlas.agent import AgentResult, CancelReason
+from codex_atlas.agent import AgentResult, CancelReason, Citation
 from codex_atlas.indexer.ast_parser import ParsedFile, Symbol, SymbolKind
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.mcp_server import (
@@ -328,3 +328,64 @@ class TestModelShapes:
     def test_codebase_stats_default_language(self) -> None:
         stats = CodebaseStats(n_nodes=0, n_edges=0, graph_path="x")
         assert stats.language == "python"
+
+
+class TestCodeSearchHitScoreAndText:
+    """``CodeSearchHit.score`` and ``.text`` must reflect the actual chunk.
+
+    The MCP layer historically hardcoded ``score=0.0`` and ``text=""``
+    even though the Pydantic schema advertised real fields. Wire the
+    agent's ``Citation`` (which now carries score + text from the
+    retrieved chunks) through to the response so score-aware clients
+    (re-rankers, snippet renderers) see real numbers.
+    """
+
+    async def test_codesearchhit_has_real_score_and_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_agent(top_k: int = 8) -> _StubAgent:
+            agent = _StubAgent()
+
+            async def _run(
+                query: str, *, route_override: Route | None = None
+            ) -> AgentResult:
+                return AgentResult(
+                    query=query,
+                    final_query=query,
+                    answer="stub answer",
+                    citations=[
+                        Citation(
+                            qualified_name="m.foo",
+                            file_path="m.py",
+                            lineno_start=1,
+                            lineno_end=3,
+                            score=0.87,
+                            text="def foo():\n    return 1\n",
+                        ),
+                        Citation(
+                            qualified_name="m.bar",
+                            file_path="m.py",
+                            lineno_start=5,
+                            lineno_end=7,
+                            score=0.42,
+                            text="def bar():\n    return 2\n",
+                        ),
+                    ],
+                    route=Route.LOOKUP,
+                    grade=1.0,
+                    attempts=1,
+                    trace=[],
+                )
+
+            agent.run = _run  # type: ignore[method-assign]
+            return agent
+
+        monkeypatch.setattr(mcp_server, "_agent", fake_agent)
+        resp = await search_code("anything")
+        assert len(resp.citations) == 2
+        # Real score from the retrieved chunk, not the hardcoded 0.0.
+        assert resp.citations[0].score == pytest.approx(0.87)
+        assert resp.citations[1].score == pytest.approx(0.42)
+        # Non-empty text matching the chunk source.
+        assert resp.citations[0].text == "def foo():\n    return 1\n"
+        assert resp.citations[1].text == "def bar():\n    return 2\n"

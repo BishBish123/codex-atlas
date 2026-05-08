@@ -185,14 +185,19 @@ async def _agent(top_k: int = 8) -> Agent:
 
 
 def _to_response(result: AgentResult) -> SearchResponse:
+    # Surface the per-chunk score + text the agent threaded through the
+    # ``Citation`` record. Earlier the MCP layer hardcoded score=0.0 and
+    # text="" — the schema advertised score: float and text: str but
+    # every response flatlined those fields, which made score-aware
+    # downstream code (re-ranking, snippet rendering) impossible.
     hits = [
         CodeSearchHit(
             qualified_name=c.qualified_name,
             file_path=c.file_path,
             lineno_start=c.lineno_start,
             lineno_end=c.lineno_end,
-            score=0.0,
-            text="",
+            score=c.score,
+            text=c.text,
         )
         for c in result.citations
     ]

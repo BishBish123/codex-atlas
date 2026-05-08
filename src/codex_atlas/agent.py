@@ -149,12 +149,24 @@ class ValidationReport:
 
 @dataclass(frozen=True)
 class Citation:
-    """A pointer into the corpus included with every answer."""
+    """A pointer into the corpus included with every answer.
+
+    ``score`` is the retriever's per-chunk confidence (cosine similarity
+    for the lookup route, hybrid combined score on the hybrid route,
+    1.0 for the structural route — same value the retriever attaches to
+    each ``StoredChunk``). ``text`` is the chunk source text. Both
+    fields default to "neutral" values so older callers that construct
+    a ``Citation`` without them keep working — the MCP boundary now
+    surfaces real values when the agent wires them through, instead of
+    the hardcoded 0.0 / "" the API contract previously lied about.
+    """
 
     qualified_name: str
     file_path: str
     lineno_start: int
     lineno_end: int
+    score: float = 0.0
+    text: str = ""
 
 
 @dataclass(frozen=True)
@@ -686,6 +698,8 @@ class Agent:
                 file_path=c.file_path,
                 lineno_start=c.lineno_start,
                 lineno_end=c.lineno_end,
+                score=c.score,
+                text=c.text,
             )
             for c in chunks
         ]

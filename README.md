@@ -126,17 +126,17 @@ Then in your MCP client config:
 
 ## Eval results
 
-The 12-question golden set runs `atlas eval` against this repo's own `src/` (a hermetic corpus — no external clone required). Real numbers in [evals/REPORT.md](evals/REPORT.md).
+The 16-question golden set runs `atlas eval` against this repo's own `src/` (a hermetic corpus — no external clone required). Real numbers in [evals/REPORT.md](evals/REPORT.md).
 
 | Metric | Value |
 | --- | ---: |
-| Route correctness | 91.7% |
+| Route correctness | 93.8% |
 | Citation recall (mean, structural) | 0.67 |
-| p50 latency (ms) | 175.6 |
+| p50 latency (ms) | 2.0 |
 
 The lookup / hybrid / summarization recall is intentionally measured with `FakeEncoder` (deterministic blake2b — no model download required). With a real `BAAI/bge-small-en-v1.5` encoder, those numbers jump significantly. The harness is wired to take any `Encoder` Protocol implementation, so swapping is one line.
 
-The eval report includes a hand-written **6-failure-mode taxonomy** with mitigation status — that's the section a senior reviewer should read first.
+The eval report includes a hand-written **7-failure-mode taxonomy** with mitigation status — that's the section a senior reviewer should read first.
 
 ## Stack
 
@@ -149,7 +149,7 @@ The eval report includes a hand-written **6-failure-mode taxonomy** with mitigat
 | Embedder | sentence-transformers (`bge-small`) | Free, fast, top-tier on MTEB; gated extra for Intel macOS |
 | Agent loop | Hand-rolled async state machine | LangGraph-style nodes without the dep; trace surface is identical |
 | CLI | Typer + Rich | Standard for new Python in 2026 |
-| Tests | pytest + pytest-asyncio | 163 tests, mocked DB / API |
+| Tests | pytest + pytest-asyncio | 244 tests, mocked DB / API |
 
 ## Layout
 

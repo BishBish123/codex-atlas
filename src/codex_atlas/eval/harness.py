@@ -393,6 +393,15 @@ def render_report(results: list[EvalResult]) -> str:
         "| --- | ---: |",
     ]
     for bucket, count in counts.items():
+        # OUTDATED_INDEX is currently unreachable in ``_classify_failure``
+        # (the answer-text heuristic was paraphrase-sensitive and got
+        # removed). The bucket is kept in the enum for future structured
+        # detection — until then it'd render as a permanent zero-count
+        # row that misleads readers about the taxonomy's coverage. Skip
+        # it from the rendered table; consumers of the JSON dump still
+        # see it in ``failure_taxonomy_counts``.
+        if bucket == str(FailureBucket.OUTDATED_INDEX):
+            continue
         lines.append(f"| {bucket} | {count} |")
     lines += [""]
 

@@ -16,13 +16,13 @@
 | --- | ---: |
 | Questions | 16 |
 | Route correctness | 93.8% |
-| Citation recall (mean) | 0.22 |
+| Citation recall (mean) | 0.19 |
 | Citation precision (mean) | 0.06 |
-| p50 latency (ms) | 2.3 |
-| p95 latency (ms) | 3.7 |
-| p99 latency (ms) | 3.7 |
+| p50 latency (ms) | 2.0 |
+| p95 latency (ms) | 3.2 |
+| p99 latency (ms) | 3.2 |
 | Tool calls / q (mean) | 2.00 |
-| Cost estimate (USD, total) | 0.2750 |
+| Cost estimate (USD, total) | 0.2771 |
 
 ## By category
 
@@ -35,7 +35,7 @@
 | neighborhood | 2 | 100% | 0.50 | 0.12 |
 | out-of-scope | 1 | 100% | 0.00 | 0.00 |
 | structural | 3 | 100% | 0.67 | 0.24 |
-| summarization | 2 | 100% | 0.25 | 0.02 |
+| summarization | 2 | 100% | 0.00 | 0.00 |
 
 ## Failure taxonomy
 
@@ -45,31 +45,30 @@
 | missing_node | 0 |
 | wrong_route | 1 |
 | hallucinated | 3 |
-| partial | 1 |
+| partial | 0 |
 | ungrounded | 2 |
-| off_topic | 9 |
-| outdated_index | 0 |
+| off_topic | 10 |
 
 ## Per question
 
 | qid | route ok | recall | prec | ms | tools | bucket | preview |
 | --- | :---: | ---: | ---: | ---: | ---: | --- | --- |
-| lookup-1 | yes | 0.00 | 0.00 | 3.7 | 3 | off_topic | # what does Encoder do (in this codebase, with code-level detail)  ## `codex_atl |
-| lookup-2 | yes | 0.00 | 0.00 | 3.6 | 3 | off_topic | # explain how chunk_id is constructed (in this codebase, with code-level detail) |
-| lookup-3 | yes | 0.00 | 0.00 | 3.6 | 3 | off_topic | # how does the heuristic grader score retrieval (in this codebase, with code-lev |
-| structural-1 | yes | 1.00 | 0.33 | 0.7 | 1 | hallucinated | # who calls find_callers  ## `codex_atlas.indexer.graph.CallGraph._traverse` (/U |
+| lookup-1 | yes | 0.00 | 0.00 | 3.2 | 3 | off_topic | # what does Encoder do (in this codebase, with code-level detail)  ## `codex_atl |
+| lookup-2 | yes | 0.00 | 0.00 | 3.2 | 3 | off_topic | # explain how chunk_id is constructed (in this codebase, with code-level detail) |
+| lookup-3 | yes | 0.00 | 0.00 | 3.0 | 3 | off_topic | # how does the heuristic grader score retrieval (in this codebase, with code-lev |
+| structural-1 | yes | 1.00 | 0.33 | 0.6 | 1 | hallucinated | # who calls find_callers  ## `codex_atlas.indexer.graph.CallGraph._traverse` (/U |
 | structural-2 | yes | 1.00 | 0.40 | 0.4 | 1 | hallucinated | # who calls _extract_qualified_name  ## `codex_atlas.indexer.graph.CallGraph.has |
-| structural-3 | yes | 0.00 | 0.00 | 1.5 | 1 | off_topic | # callers of register_async  ## `codex_atlas.indexer.ast_parser._Collector._hand |
-| hybrid-1 | no | 0.00 | 0.00 | 3.7 | 3 | wrong_route | # show me all retriever-related code (in this codebase, with code-level detail)  |
-| hybrid-2 | yes | 0.00 | 0.00 | 3.2 | 1 | off_topic | # end-to-end indexing pipeline  ## `codex_atlas.agent.Agent.run` (/Users/bishara |
-| summary-1 | yes | 0.50 | 0.05 | 2.2 | 1 | partial | # walk me through the agent loop  ## `codex_atlas.indexer.graph.CallGraph.has_sy |
-| summary-2 | yes | 0.00 | 0.00 | 2.4 | 1 | off_topic | # overview of the indexer module  ## `codex_atlas.mcp_server._graph` (/Users/bis |
+| structural-3 | yes | 0.00 | 0.00 | 1.2 | 1 | off_topic | # callers of register_async  ## `codex_atlas.indexer.ast_parser._Collector._hand |
+| hybrid-1 | no | 0.00 | 0.00 | 2.9 | 3 | wrong_route | # show me all retriever-related code (in this codebase, with code-level detail)  |
+| hybrid-2 | yes | 0.00 | 0.00 | 2.5 | 1 | off_topic | # end-to-end indexing pipeline  ## `codex_atlas.agent.Agent.run` (/Users/bishara |
+| summary-1 | yes | 0.00 | 0.00 | 2.1 | 1 | off_topic | # walk me through the agent loop  ## `codex_atlas.mcp_server._agent` (/Users/bis |
+| summary-2 | yes | 0.00 | 0.00 | 1.9 | 1 | off_topic | # overview of the indexer module  ## `codex_atlas.mcp_server._graph` (/Users/bis |
 | neighborhood-1 | yes | 1.00 | 0.25 | 0.3 | 1 | hallucinated | # neighborhood of codex_atlas.indexer.graph.CallGraph.find_callers  ## `codex_at |
-| neighborhood-2 | yes | 0.00 | 0.00 | 0.4 | 1 | off_topic | # everything around codex_atlas.retriever.Retriever.retrieve  ## `codex_atlas.ag |
+| neighborhood-2 | yes | 0.00 | 0.00 | 0.3 | 1 | off_topic | # everything around codex_atlas.retriever.Retriever.retrieve  ## `codex_atlas.ag |
 | import-chain-1 | yes | 0.00 | 0.00 | 0.2 | 3 | ungrounded | I could not find any relevant code chunks for that query in the indexed corpus.  |
 | import-chain-2 | yes | 0.00 | 0.00 | 0.2 | 3 | ungrounded | I could not find any relevant code chunks for that query in the indexed corpus.  |
-| refusal-1 | yes | 0.00 | 0.00 | 3.5 | 3 | off_topic | # what does frobnicate_widget do (in this codebase, with code-level detail)  ##  |
-| oos-1 | yes | 0.00 | 0.00 | 3.5 | 3 | off_topic | # how do I deploy this to AWS Lambda (in this codebase, with code-level detail)  |
+| refusal-1 | yes | 0.00 | 0.00 | 3.1 | 3 | off_topic | # what does frobnicate_widget do (in this codebase, with code-level detail)  ##  |
+| oos-1 | yes | 0.00 | 0.00 | 3.2 | 3 | off_topic | # how do I deploy this to AWS Lambda (in this codebase, with code-level detail)  |
 
 ## Reading the numbers honestly
 
@@ -116,5 +115,4 @@
 | 4 | Re-query loop never converges | Hard cap at `max_attempts` + step/run timeouts | Implemented (`AgentConfig.max_attempts=3`, `step_timeout_s`, `run_timeout_s`) | mitigated |
 | 5 | Token budget blowout on summarization | Pre-compute module-level summaries; cap chunks at synthesis | Partial — `StitchSynthesizer.max_chunks` is hard-bounded | partial |
 | 6 | Cross-language mis-embeds | Language-aware chunking + tagged embeddings | TODO; v2 is Python-only | known |
-| 7 | Outdated index referenced in answer | Heuristic flag + freshness signal | Heuristic only — `failure_bucket=outdated_index` reports it | partial |
-| 8 | Gold qname missing from index | `MISSING_NODE` bucket detected from `indexed_qnames` | Implemented in `score_result` / `run_eval` | mitigated |
+| 7 | Gold qname missing from index | `MISSING_NODE` bucket detected from `indexed_qnames` | Implemented in `score_result` / `run_eval` | mitigated |

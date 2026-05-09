@@ -129,13 +129,9 @@ bash scripts/play_demo.sh
 asciinema play assets/demo.cast
 ```
 
-**Embed on asciinema.org** — upload the cast and use the generated embed link:
+**Watch on asciinema.org:**
 
-```html
-<a href="https://asciinema.org/a/<ID>">
-  <img src="https://asciinema.org/a/<ID>.svg" />
-</a>
-```
+[![asciicast](https://asciinema.org/a/LhtcqI2ZjiJY2j4W.svg)](https://asciinema.org/a/LhtcqI2ZjiJY2j4W)
 
 **Refresh the cast** after code changes:
 

@@ -141,6 +141,8 @@ The 16-question golden set runs `atlas eval` against this repo's own `src/` (a h
 
 The lookup / hybrid / summarization recall is intentionally measured with `FakeEncoder` (deterministic blake2b — no model download required). With a real `BAAI/bge-small-en-v1.5` encoder, those numbers jump significantly. The harness is wired to take any `Encoder` Protocol implementation, so swapping is one line.
 
+`atlas eval` defaults to `--store=memory` — the harness rebuilds the index from `--corpus` (default `src/`) on the fly, so no Postgres + pgvector container is required to reproduce the baseline. `evals/baseline.json` is regenerated from a `--store=memory` run, which keeps the CI gate hermetic. Pass `--store=postgres` if you want to evaluate against an existing pgvector index instead.
+
 The eval report includes a hand-written **7-failure-mode taxonomy** with mitigation status — that's the section a senior reviewer should read first.
 
 ## Stack

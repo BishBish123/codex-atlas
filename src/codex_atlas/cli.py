@@ -500,10 +500,11 @@ def eval_cmd(  # noqa: PLR0915
         0.05, help="Fractional tolerance for the baseline regression gate."
     ),
     store_backend: str = typer.Option(
-        "postgres",
+        "memory",
         "--store",
-        help="`postgres` (pgvector via POSTGRES_DSN) or `memory` (dict-backed, "
-        "rebuilds the index from the corpus on the fly — no DB required).",
+        help="`memory` (default; dict-backed, rebuilds the index from the "
+        "corpus on the fly — no DB required) or `postgres` "
+        "(pgvector via POSTGRES_DSN).",
     ),
     corpus: Path = typer.Option(
         Path("src"),

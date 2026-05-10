@@ -120,6 +120,37 @@ def _dsn() -> str:
     return dsn
 
 
+# Default location for the on-disk InMemoryChunkStore snapshot. Kept next
+# to ``data/graph.json`` so a memory-store user has a single ``data/``
+# directory holding the whole hermetic index.
+DEFAULT_MEMORY_STORE_PATH = Path("data/chunks.json")
+
+
+async def _open_query_store(
+    *, store_backend: str, dim: int, memory_path: Path
+) -> ChunkStoreProtocol:
+    """Open a chunk store for read-only query commands (ask/search/explain/mcp).
+
+    ``memory`` reads a snapshot written by ``atlas index --store=memory``;
+    ``postgres`` opens a pgvector pool via ``POSTGRES_DSN``. Anything
+    else is rejected with a typed user error so the CLI surfaces a clean
+    exit 2 rather than a stack trace.
+    """
+    if store_backend == "memory":
+        if not memory_path.exists():
+            _bail(
+                f"in-memory chunk store snapshot not found at {memory_path}; "
+                f"run `atlas index --store=memory` first to build it"
+            )
+        store = await InMemoryChunkStore.load_from_path(memory_path)
+        return store
+    if store_backend == "postgres":
+        pg_store = ChunkStore(dsn=_dsn())
+        await pg_store.setup(dim=dim)
+        return pg_store
+    _bail(f"unknown --store value {store_backend!r} (expected: memory, postgres)")
+
+
 @app.command()
 def index(
     corpus: Path = typer.Argument(..., help="Directory to index."),
@@ -143,10 +174,21 @@ def index(
         "--skip-embed",
         help="Skip pgvector upsert. Useful with --format json for graph-only debug.",
     ),
+    store_backend: str = typer.Option(
+        "memory",
+        "--store",
+        help="`memory` (default; serialises to data/chunks.json — no DB) or "
+        "`postgres` (pgvector via POSTGRES_DSN).",
+    ),
+    chunks_out: Path = typer.Option(
+        DEFAULT_MEMORY_STORE_PATH,
+        "--chunks-out",
+        help="Where to persist the in-memory chunk snapshot when --store=memory.",
+    ),
 ) -> None:
     """Walk `corpus`, parse every .py, embed every chunk, persist the graph."""
 
-    async def _run() -> None:
+    async def _run() -> None:  # noqa: PLR0912
         encoder_obj = _resolve_encoder(encoder)
         if output_format == "rich":
             console.print(f"[green]parsing[/] {corpus}")
@@ -181,6 +223,7 @@ def index(
                     },
                 },
                 "encoder": encoder_obj.name,
+                "store": store_backend,
             }
             sys.stdout.write(json.dumps(payload, indent=2) + "\n")
         if skip_embed:
@@ -193,6 +236,22 @@ def index(
         if output_format == "rich":
             console.print(f"[green]embedding[/] {len(chunks)} chunks via {encoder_obj.name}")
         vectors = encoder_obj.encode([c.text for c in chunks])
+
+        if store_backend == "memory":
+            mem_store = InMemoryChunkStore()
+            await mem_store.setup(dim=encoder_obj.dim, drop_existing=drop_existing)
+            n_written = await mem_store.upsert_chunks(chunks, vectors)
+            await mem_store.save_to_path(chunks_out)
+            if output_format == "rich":
+                console.print(
+                    f"[green]wrote[/] {n_written} chunks to {chunks_out} (in-memory store)"
+                )
+            return
+        if store_backend != "postgres":
+            _bail(
+                f"unknown --store value {store_backend!r} "
+                f"(expected: memory, postgres)"
+            )
 
         store = ChunkStore(dsn=_dsn())
         await store.setup(dim=encoder_obj.dim, drop_existing=drop_existing)
@@ -223,14 +282,28 @@ def ask(
     graph: Path = typer.Option(Path("data/graph.json"), help="Persisted call graph."),
     encoder: str = typer.Option("fake", help="Encoder used at index time."),
     top_k: int = typer.Option(8, help="Top-k retrieval cap."),
+    store_backend: str = typer.Option(
+        "memory",
+        "--store",
+        help="`memory` (default; reads data/chunks.json — no DB) or "
+        "`postgres` (pgvector via POSTGRES_DSN).",
+    ),
+    chunks_path: Path = typer.Option(
+        DEFAULT_MEMORY_STORE_PATH,
+        "--chunks",
+        help="Path to the chunk snapshot when --store=memory.",
+    ),
 ) -> None:
     """Run a single agent query end-to-end."""
 
     async def _run() -> None:
         encoder_obj = _resolve_encoder(encoder)
         cg = CallGraph.load(graph)
-        store = ChunkStore(dsn=_dsn())
-        await store.setup(dim=encoder_obj.dim)
+        store = await _open_query_store(
+            store_backend=store_backend,
+            dim=encoder_obj.dim,
+            memory_path=chunks_path,
+        )
         retriever = Retriever(encoder_obj, store, cg, RetrieverConfig(top_k=top_k))
         agent = Agent(retriever)
         result = await agent.run(question)
@@ -262,14 +335,28 @@ def search(
         "--format",
         help="`rich` (default) or `json` for one-shot machine-readable output.",
     ),
+    store_backend: str = typer.Option(
+        "memory",
+        "--store",
+        help="`memory` (default; reads data/chunks.json — no DB) or "
+        "`postgres` (pgvector via POSTGRES_DSN).",
+    ),
+    chunks_path: Path = typer.Option(
+        DEFAULT_MEMORY_STORE_PATH,
+        "--chunks",
+        help="Path to the chunk snapshot when --store=memory.",
+    ),
 ) -> None:
     """One-shot retrieval — runs the router but skips the answer synthesis."""
 
     async def _run() -> None:
         encoder_obj = _resolve_encoder(encoder)
         cg = CallGraph.load(graph)
-        store = ChunkStore(dsn=_dsn())
-        await store.setup(dim=encoder_obj.dim)
+        store = await _open_query_store(
+            store_backend=store_backend,
+            dim=encoder_obj.dim,
+            memory_path=chunks_path,
+        )
         retriever = Retriever(encoder_obj, store, cg, RetrieverConfig(top_k=top_k))
         result = await retriever.retrieve(query)
         if output_format == "json":
@@ -323,14 +410,28 @@ def explain(
     qualified_name: str = typer.Argument(..., help="Qualified name to explain."),
     graph: Path = typer.Option(Path("data/graph.json"), help="Persisted call graph."),
     encoder: str = typer.Option("fake", help="Encoder used at index time."),
+    store_backend: str = typer.Option(
+        "memory",
+        "--store",
+        help="`memory` (default; reads data/chunks.json — no DB) or "
+        "`postgres` (pgvector via POSTGRES_DSN).",
+    ),
+    chunks_path: Path = typer.Option(
+        DEFAULT_MEMORY_STORE_PATH,
+        "--chunks",
+        help="Path to the chunk snapshot when --store=memory.",
+    ),
 ) -> None:
     """One-shot agent run anchored on a qualified name (uses structural route)."""
 
     async def _run() -> None:
         encoder_obj = _resolve_encoder(encoder)
         cg = CallGraph.load(graph)
-        store = ChunkStore(dsn=_dsn())
-        await store.setup(dim=encoder_obj.dim)
+        store = await _open_query_store(
+            store_backend=store_backend,
+            dim=encoder_obj.dim,
+            memory_path=chunks_path,
+        )
         retriever = Retriever(encoder_obj, store, cg, RetrieverConfig(top_k=8))
         agent = Agent(retriever)
         result = await agent.run(f"who calls {qualified_name}")
@@ -348,8 +449,26 @@ def mcp(
     transport: str = typer.Option("stdio", help="MCP transport: stdio | http"),
     host: str = typer.Option("127.0.0.1", help="HTTP bind host."),
     port: int = typer.Option(8090, help="HTTP bind port."),
+    store_backend: str = typer.Option(
+        "memory",
+        "--store",
+        help="`memory` (default; reads data/chunks.json — no DB) or "
+        "`postgres` (pgvector via POSTGRES_DSN).",
+    ),
+    chunks_path: Path = typer.Option(
+        DEFAULT_MEMORY_STORE_PATH,
+        "--chunks",
+        help="Path to the chunk snapshot when --store=memory.",
+    ),
 ) -> None:
     """Start the Codex-Atlas MCP server (alias for `atlas-mcp run`)."""
+    # Forward store choice to the MCP server via env. The server reads
+    # ``ATLAS_STORE`` and ``ATLAS_CHUNKS_PATH`` at first-tool-call time.
+    if store_backend not in {"memory", "postgres"}:
+        _bail(f"unknown --store value {store_backend!r} (expected: memory, postgres)")
+    os.environ["ATLAS_STORE"] = store_backend
+    os.environ["ATLAS_CHUNKS_PATH"] = str(chunks_path)
+
     from codex_atlas.mcp_server import mcp as mcp_app  # noqa: PLC0415
 
     with _command_wrapper():

@@ -87,6 +87,162 @@ class TestIndexJsonFormat:
         assert graph_out.exists()
 
 
+class TestMemoryStore:
+    """``--store=memory`` removes the Postgres requirement from index/ask/search/explain.
+
+    ``atlas index --store=memory`` must dump a ``data/chunks.json`` snapshot
+    that subsequent commands can read back; ``atlas ask --store=memory``
+    must succeed end-to-end with no DSN env var set.
+    """
+
+    def test_index_memory_store_persists_to_disk(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # No DSN — the memory backend must not touch Postgres.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "a.py").write_text("def alpha():\n    return 1\n")
+        graph_out = tmp_path / "graph.json"
+        chunks_out = tmp_path / "chunks.json"
+        result = runner.invoke(
+            app,
+            [
+                "index",
+                str(corpus),
+                "--graph-out",
+                str(graph_out),
+                "--store",
+                "memory",
+                "--chunks-out",
+                str(chunks_out),
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert chunks_out.exists()
+        # The persisted snapshot is a JSON object with rows + dim.
+        payload = json.loads(chunks_out.read_text())
+        assert payload["dim"] >= 1
+        assert any(c["qualified_name"].endswith(".alpha") for c in payload["chunks"])
+
+    def test_ask_memory_store_reads_persisted_chunks(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # Build the snapshot first via `atlas index --store=memory`.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "a.py").write_text(
+            "def alpha():\n    return 1\n\n"
+            "def beta():\n    alpha()\n    return 2\n"
+        )
+        graph_out = tmp_path / "graph.json"
+        chunks_out = tmp_path / "chunks.json"
+        result = runner.invoke(
+            app,
+            [
+                "index",
+                str(corpus),
+                "--graph-out",
+                str(graph_out),
+                "--store",
+                "memory",
+                "--chunks-out",
+                str(chunks_out),
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+
+        # Now ``atlas ask --store=memory`` must work without POSTGRES_DSN.
+        ask_result = runner.invoke(
+            app,
+            [
+                "ask",
+                "who calls alpha",
+                "--graph",
+                str(graph_out),
+                "--store",
+                "memory",
+                "--chunks",
+                str(chunks_out),
+            ],
+        )
+        assert ask_result.exit_code == 0, ask_result.stdout
+        # The agent's "Route:" header lands on stdout regardless of route.
+        assert "Route:" in ask_result.stdout
+
+    def test_full_index_then_ask_no_postgres(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # End-to-end: a fresh checkout with no DSN env var should be able
+        # to index + ask. Search also goes through the same path; cover it.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        corpus = tmp_path / "corpus"
+        corpus.mkdir()
+        (corpus / "a.py").write_text("def gamma():\n    return 'g'\n")
+        graph_out = tmp_path / "graph.json"
+        chunks_out = tmp_path / "chunks.json"
+        idx = runner.invoke(
+            app,
+            [
+                "index",
+                str(corpus),
+                "--graph-out",
+                str(graph_out),
+                "--store",
+                "memory",
+                "--chunks-out",
+                str(chunks_out),
+            ],
+        )
+        assert idx.exit_code == 0, idx.stdout
+
+        srch = runner.invoke(
+            app,
+            [
+                "search",
+                "gamma",
+                "--graph",
+                str(graph_out),
+                "--store",
+                "memory",
+                "--chunks",
+                str(chunks_out),
+                "--format",
+                "json",
+            ],
+        )
+        assert srch.exit_code == 0, srch.stdout
+        payload = json.loads(srch.stdout[srch.stdout.index("{") :])
+        assert "route" in payload
+        assert "chunks" in payload
+
+    def test_ask_memory_store_missing_snapshot_errors_clearly(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # No snapshot -> exit 2 + actionable message ("run `atlas index ...`").
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        graph_out = tmp_path / "graph.json"
+        # Even without a graph the snapshot check fires first if it exists.
+        # Use a real graph so we don't conflate the two error paths.
+        graph_out.write_text('{"nodes": [], "edges": []}')
+        result = runner.invoke(
+            app,
+            [
+                "ask",
+                "anything",
+                "--graph",
+                str(graph_out),
+                "--store",
+                "memory",
+                "--chunks",
+                str(tmp_path / "missing.json"),
+            ],
+        )
+        assert result.exit_code == 2
+        assert "atlas index" in result.stdout
+
+
 class TestDebugFlag:
     def test_debug_flag_accepted(self) -> None:
         result = runner.invoke(app, ["--debug", "--help"])

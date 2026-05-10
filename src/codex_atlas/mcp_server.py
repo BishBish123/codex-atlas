@@ -138,6 +138,25 @@ _cached_graph: CallGraph | None = None
 _init_lock: asyncio.Lock = asyncio.Lock()
 
 
+def _store_backend() -> str:
+    """Resolve the chunk-store backend from env.
+
+    Defaults to ``memory`` so a fresh checkout with ``atlas index --store=memory``
+    can serve MCP queries immediately, without a Postgres + pgvector
+    container. ``postgres`` switches back to the pgvector adapter.
+    """
+    backend = os.environ.get("ATLAS_STORE", "memory")
+    if backend not in {"memory", "postgres"}:
+        raise RuntimeError(
+            f"unknown ATLAS_STORE={backend!r}; expected one of: memory, postgres"
+        )
+    return backend
+
+
+def _chunks_path() -> Path:
+    return Path(os.environ.get("ATLAS_CHUNKS_PATH", "data/chunks.json"))
+
+
 async def _agent(top_k: int = 8) -> Agent:
     """Build an agent for one request, reusing a process-wide store + graph.
 
@@ -148,7 +167,7 @@ async def _agent(top_k: int = 8) -> Agent:
     on first use so subsequent requests don't re-run DDL or re-load
     the graph from disk.
     """
-    from codex_atlas.store import ChunkStore  # noqa: PLC0415
+    from codex_atlas.store import ChunkStore, InMemoryChunkStore  # noqa: PLC0415
 
     global _cached_store, _cached_encoder, _cached_graph  # noqa: PLW0603
     # Fast path: every cache populated, no lock needed.
@@ -170,9 +189,13 @@ async def _agent(top_k: int = 8) -> Agent:
         if _cached_encoder is None:
             _cached_encoder = _encoder()
         if _cached_store is None:
-            store = ChunkStore(dsn=_dsn())
-            await store.setup(dim=_cached_encoder.dim)
-            _cached_store = store
+            backend = _store_backend()
+            if backend == "memory":
+                _cached_store = await InMemoryChunkStore.load_from_path(_chunks_path())
+            else:
+                store = ChunkStore(dsn=_dsn())
+                await store.setup(dim=_cached_encoder.dim)
+                _cached_store = store
         if _cached_graph is None:
             _cached_graph = _graph()
     retriever = Retriever(

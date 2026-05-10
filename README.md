@@ -78,21 +78,26 @@ git clone https://github.com/BishBish123/codex-atlas.git
 cd codex-atlas
 make install          # uv sync (+ embed extra on supported platforms)
 
-# Boot a Postgres + pgvector container.
-docker run -d --name codex-atlas-pg \
-    -e POSTGRES_PASSWORD=bench -e POSTGRES_USER=bench -e POSTGRES_DB=bench \
-    -p 5433:5432 pgvector/pgvector:pg17
-export POSTGRES_DSN=postgresql://bench:bench@localhost:5433/bench
+# No Docker, no DB — index into a JSON snapshot at data/chunks.json.
+uv run atlas index src/ --store=memory
 
-# Index this very repo as the demo corpus.
-uv run atlas index src/ --encoder fake --drop-existing
-
-# Ask a question.
-uv run atlas ask "who calls find_callers"
+# Ask a question (reads data/chunks.json + data/graph.json).
+uv run atlas ask "who calls find_callers" --store=memory
 
 # Run the golden test set.
 uv run atlas eval --json-out evals/scores.json
 cat evals/REPORT.md
+```
+
+Want pgvector instead? Boot Postgres + pgvector and switch the flag:
+
+```bash
+docker run -d --name codex-atlas-pg \
+    -e POSTGRES_PASSWORD=bench -e POSTGRES_USER=bench -e POSTGRES_DB=bench \
+    -p 5433:5432 pgvector/pgvector:pg17
+export POSTGRES_DSN=postgresql://bench:bench@localhost:5433/bench
+uv run atlas index src/ --store=postgres --encoder fake --drop-existing
+uv run atlas ask "who calls find_callers" --store=postgres
 ```
 
 ## Run as an MCP server

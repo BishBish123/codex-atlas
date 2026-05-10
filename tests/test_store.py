@@ -598,3 +598,42 @@ class TestSetupRaceProtection:
             await store.fetch_by_qualified_name("anything")
         with pytest.raises(RuntimeError, match="not initialized"):
             await store.delete_by_file_path("anything.py")
+
+
+class TestInMemoryStorePersistence:
+    """``InMemoryChunkStore.save_to_path`` + ``load_from_path`` round-trip.
+
+    The hermetic ``--store=memory`` flow depends on the indexer
+    serialising the in-memory rows to disk so subsequent ``ask`` /
+    ``search`` invocations can read them back without re-embedding.
+    """
+
+    async def test_round_trip_preserves_search_ranking(self, tmp_path: Any) -> None:
+        store = InMemoryChunkStore()
+        await store.setup(dim=8)
+        rng = np.random.default_rng(seed=11)
+        chunks = [_chunk(f"m.fn_{i}", i) for i in range(20)]
+        vectors = rng.standard_normal((20, 8)).astype(np.float32)
+        await store.upsert_chunks(chunks, vectors)
+        path = tmp_path / "chunks.json"
+        await store.save_to_path(path)
+        assert path.exists()
+
+        # Load into a fresh store and verify search returns the same top-1.
+        loaded = await InMemoryChunkStore.load_from_path(path)
+        results = await loaded.search(vectors[7], k=3)
+        assert results[0].qualified_name == "m.fn_7"
+        assert results[0].score == pytest.approx(1.0, rel=1e-4)
+        # fetch_by_qualified_name keeps working after the round-trip.
+        row = await loaded.fetch_by_qualified_name("m.fn_3")
+        assert row is not None
+        assert row.qualified_name == "m.fn_3"
+
+    async def test_save_before_setup_errors(self, tmp_path: Any) -> None:
+        store = InMemoryChunkStore()
+        with pytest.raises(RuntimeError, match="setup"):
+            await store.save_to_path(tmp_path / "chunks.json")
+
+    async def test_load_missing_file_errors(self, tmp_path: Any) -> None:
+        with pytest.raises(FileNotFoundError, match="atlas index"):
+            await InMemoryChunkStore.load_from_path(tmp_path / "nope.json")

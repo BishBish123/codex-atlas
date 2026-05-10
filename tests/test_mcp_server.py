@@ -265,8 +265,12 @@ class TestCachedStoreInitIdempotence:
 
         monkeypatch.setattr(store_mod, "ChunkStore", _FakeStore)
 
-        # Provide a DSN so ``_dsn()`` doesn't raise.
+        # Provide a DSN so ``_dsn()`` doesn't raise. Force the postgres
+        # backend explicitly — the default backend is now ``memory`` so
+        # this test would otherwise exercise the in-memory path and skip
+        # the ``ChunkStore`` patch entirely.
         monkeypatch.setenv("POSTGRES_DSN", "postgresql://stub")
+        monkeypatch.setenv("ATLAS_STORE", "postgres")
         # The encoder factory + graph loader should still work; the
         # graph fixture has set ATLAS_GRAPH_PATH.
 

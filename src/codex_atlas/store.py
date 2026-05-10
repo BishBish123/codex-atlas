@@ -17,10 +17,12 @@ would just hold idle connections.
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import asyncpg
@@ -467,3 +469,69 @@ class InMemoryChunkStore:
                 del self._rows[cid]
                 self._vectors.pop(cid, None)
             return len(doomed)
+
+    async def save_to_path(self, path: str | Path) -> Path:
+        """Serialise the in-memory state to ``path`` as JSON.
+
+        Persistence is the missing half of ``--store=memory``: without
+        it, ``atlas index --store=memory`` would build the embedding
+        table inside the indexer process and immediately discard it,
+        forcing every ``ask`` / ``search`` to reindex inline. We dump
+        rows + vectors + dim to disk so the next CLI invocation can
+        ``load_from_path`` and serve queries with no DB.
+        """
+        if self._dim is None:
+            raise RuntimeError("save_to_path() called before setup()")
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        async with self._lock:
+            payload = {
+                "dim": self._dim,
+                "chunks": [
+                    {
+                        "chunk_id": row.chunk_id,
+                        "qualified_name": row.qualified_name,
+                        "file_path": row.file_path,
+                        "lineno_start": row.lineno_start,
+                        "lineno_end": row.lineno_end,
+                        "kind": str(row.kind),
+                        "text": row.text,
+                        "vector": self._vectors[row.chunk_id].astype(float).tolist(),
+                    }
+                    for row in self._rows.values()
+                ],
+            }
+        # The CLI is the sole caller (one-shot write at end of `atlas
+        # index`); blocking I/O here is fine and matches the pattern
+        # already used by ``CallGraph.save``. Suppress ASYNC240 here only.
+        out.write_text(json.dumps(payload))  # noqa: ASYNC240
+        return out
+
+    @classmethod
+    async def load_from_path(cls, path: str | Path) -> InMemoryChunkStore:
+        """Build an ``InMemoryChunkStore`` from a JSON file written by ``save_to_path``."""
+        src = Path(path)
+        if not src.exists():  # noqa: ASYNC240
+            raise FileNotFoundError(
+                f"in-memory chunk store snapshot not found at {src}; "
+                f"run `atlas index --store=memory` first"
+            )
+        payload = json.loads(src.read_text())  # noqa: ASYNC240
+        dim = int(payload["dim"])
+        store = cls()
+        await store.setup(dim=dim)
+        async with store._lock:
+            for entry in payload["chunks"]:
+                cid = str(entry["chunk_id"])
+                store._rows[cid] = StoredChunk(
+                    chunk_id=cid,
+                    qualified_name=str(entry["qualified_name"]),
+                    file_path=str(entry["file_path"]),
+                    lineno_start=int(entry["lineno_start"]),
+                    lineno_end=int(entry["lineno_end"]),
+                    kind=SymbolKind(entry["kind"]),
+                    text=str(entry["text"]),
+                    score=1.0,
+                )
+                store._vectors[cid] = np.asarray(entry["vector"], dtype=np.float32)
+        return store

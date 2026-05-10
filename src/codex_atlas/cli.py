@@ -481,7 +481,7 @@ def mcp(
 
 
 @app.command(name="eval")
-def eval_cmd(
+def eval_cmd(  # noqa: PLR0915
     graph: Path = typer.Option(Path("data/graph.json"), help="Persisted call graph."),
     encoder: str = typer.Option("fake", help="Encoder used at index time."),
     out: Path = typer.Option(Path("evals/REPORT.md"), help="Where to write the markdown report."),
@@ -510,11 +510,37 @@ def eval_cmd(
         "--corpus",
         help="Source tree to index when --store=memory.",
     ),
+    rebuild_graph: bool = typer.Option(
+        False,
+        "--rebuild-graph",
+        help="Parse `--corpus` and write `--graph` from scratch before evaluating.",
+    ),
 ) -> None:
     """Run the golden test set and write a markdown + (optional) JSON report."""
 
-    async def _run() -> None:
+    async def _run() -> None:  # noqa: PLR0912
         encoder_obj = _resolve_encoder(encoder)
+        # If --rebuild-graph is set, parse the corpus and (re)write the
+        # graph file BEFORE we try to load it. This is the explicit
+        # opt-in that pairs with the actionable error below — users who
+        # don't have a graph yet can run `atlas eval --rebuild-graph
+        # --corpus src` instead of having to remember the two-step
+        # `atlas index --skip-embed` invocation.
+        if rebuild_graph:
+            parsed = parse_corpus(corpus)
+            cg_built = CallGraph()
+            cg_built.ingest(parsed)
+            cg_built.save(graph)
+            console.print(
+                f"[green]rebuilt[/] graph "
+                f"({cg_built.n_nodes} nodes, {cg_built.n_edges} edges) -> {graph}"
+            )
+        if not graph.exists():
+            _bail(
+                f"graph.json missing at {graph} — run "
+                f"`atlas index --skip-embed --corpus <path>` first, or pass "
+                f"--rebuild-graph (with --corpus) to build it inline."
+            )
         cg = CallGraph.load(graph)
         store: ChunkStoreProtocol
         if store_backend == "memory":

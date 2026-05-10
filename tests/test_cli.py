@@ -243,6 +243,75 @@ class TestMemoryStore:
         assert "atlas index" in result.stdout
 
 
+class TestEvalGraphPreflight:
+    """`atlas eval` must surface a clear error when graph.json is missing.
+
+    Before this fix the `--store=memory` path crashed with a bare
+    ``FileNotFoundError`` from inside ``CallGraph.load``. Users with no
+    pre-built graph couldn't tell what was missing. The fix pre-flight
+    checks the graph path AND adds an explicit ``--rebuild-graph`` flag
+    that builds it from `--corpus` inline.
+    """
+
+    def test_eval_missing_graph_clear_error(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        result = runner.invoke(
+            app,
+            [
+                "eval",
+                "--graph",
+                str(tmp_path / "absent.json"),
+                "--store",
+                "memory",
+                "--corpus",
+                str(tmp_path),  # empty dir is fine — we never reach indexing
+                "--out",
+                str(tmp_path / "REPORT.md"),
+            ],
+        )
+        assert result.exit_code == 2, result.stdout
+        # Rich wraps long lines; collapse whitespace before substring checks
+        # so "atlas index --skip-embed" survives a soft-wrap.
+        flat = " ".join(result.stdout.split())
+        assert "graph.json missing" in flat
+        assert "atlas index --skip-embed" in flat
+        assert "--rebuild-graph" in flat
+
+    def test_eval_rebuild_graph_builds_inline(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # With --rebuild-graph the harness parses `--corpus` and writes a
+        # fresh graph file before evaluating. The eval then runs end-to-end
+        # against the in-memory store; we just need it to exit 0 and write
+        # a report.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        corpus = tmp_path / "src"
+        corpus.mkdir()
+        (corpus / "a.py").write_text("def foo():\n    return 1\n")
+        graph_path = tmp_path / "graph.json"
+        report_path = tmp_path / "REPORT.md"
+        result = runner.invoke(
+            app,
+            [
+                "eval",
+                "--graph",
+                str(graph_path),
+                "--store",
+                "memory",
+                "--corpus",
+                str(corpus),
+                "--rebuild-graph",
+                "--out",
+                str(report_path),
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        assert graph_path.exists()
+        assert report_path.exists()
+
+
 class TestDebugFlag:
     def test_debug_flag_accepted(self) -> None:
         result = runner.invoke(app, ["--debug", "--help"])

@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = { text = "MIT" }
 authors = [{ name = "Bishara Mekhaeil" }]
-keywords = ["mcp", "graphrag", "rag", "code-search", "langgraph", "anthropic", "claude"]
+keywords = ["mcp", "graphrag", "rag", "code-search", "anthropic", "claude"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
@@ -27,8 +27,6 @@ dependencies = [
     # MCP
     "fastmcp>=2.0",
     "pydantic>=2.7",
-    # Agent loop
-    "langgraph>=0.2",
     # CLI + UX
     "typer>=0.12",
     "rich>=13.7",

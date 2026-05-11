@@ -243,6 +243,75 @@ class TestMemoryStore:
         assert "atlas index" in result.stdout
 
 
+class TestExplainForcesStructuralRoute:
+    """`atlas explain` must force ``route_override=Route.STRUCTURAL`` so the
+    classifier can't downgrade a structural intent to vector-only lookup.
+    """
+
+    def test_explain_passes_structural_route_override(
+        self, tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+    ) -> None:
+        # Build the minimal hermetic env: a tiny corpus, indexed via memory.
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        corpus = tmp_path / "src"
+        corpus.mkdir()
+        (corpus / "a.py").write_text("def foo():\n    return 1\n")
+        graph_out = tmp_path / "graph.json"
+        chunks_out = tmp_path / "chunks.json"
+        idx = runner.invoke(
+            app,
+            [
+                "index",
+                str(corpus),
+                "--graph-out",
+                str(graph_out),
+                "--store",
+                "memory",
+                "--chunks-out",
+                str(chunks_out),
+            ],
+        )
+        assert idx.exit_code == 0, idx.stdout
+
+        # Patch Agent.run to capture the route_override kw.
+        captured: dict[str, object] = {}
+
+        from codex_atlas import agent as agent_mod  # noqa: PLC0415
+
+        original_run = agent_mod.Agent.run
+
+        async def _spy_run(
+            self: agent_mod.Agent,
+            query: str,
+            *,
+            route_override: object = None,
+        ) -> object:
+            captured["route_override"] = route_override
+            captured["query"] = query
+            return await original_run(self, query, route_override=route_override)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(agent_mod.Agent, "run", _spy_run)
+
+        result = runner.invoke(
+            app,
+            [
+                "explain",
+                "a.foo",
+                "--graph",
+                str(graph_out),
+                "--store",
+                "memory",
+                "--chunks",
+                str(chunks_out),
+            ],
+        )
+        assert result.exit_code == 0, result.stdout
+        # The CLI must hand the agent an explicit structural override.
+        from codex_atlas.retriever import Route as _Route  # noqa: PLC0415
+
+        assert captured["route_override"] == _Route.STRUCTURAL
+
+
 class TestMcpStartupFailFast:
     """`atlas mcp --store=postgres` exits 2 before opening a transport when DSN is missing."""
 

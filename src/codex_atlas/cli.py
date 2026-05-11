@@ -28,7 +28,7 @@ from codex_atlas.eval.harness import (
 )
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.indexer.walker import parse_corpus
-from codex_atlas.retriever import Retriever, RetrieverConfig
+from codex_atlas.retriever import Retriever, RetrieverConfig, Route
 from codex_atlas.store import ChunkStore, ChunkStoreProtocol, InMemoryChunkStore
 
 app = typer.Typer(
@@ -422,7 +422,15 @@ def explain(
         help="Path to the chunk snapshot when --store=memory.",
     ),
 ) -> None:
-    """One-shot agent run anchored on a qualified name (uses structural route)."""
+    """One-shot agent run anchored on a qualified name.
+
+    Forces ``route=structural`` (graph-walk) so the classifier never
+    rewrites a structural intent — passing a bare qualified name like
+    ``pkg.mod.Cls.method`` previously sometimes routed as ``lookup``
+    (vector-only) when the heuristic missed the "who calls" prefix.
+    The structural route walks the call graph directly, which is what
+    every ``explain`` caller actually wants.
+    """
 
     async def _run() -> None:
         encoder_obj = _resolve_encoder(encoder)
@@ -434,7 +442,10 @@ def explain(
         )
         retriever = Retriever(encoder_obj, store, cg, RetrieverConfig(top_k=8))
         agent = Agent(retriever)
-        result = await agent.run(f"who calls {qualified_name}")
+        result = await agent.run(
+            f"who calls {qualified_name}",
+            route_override=Route.STRUCTURAL,
+        )
         console.print(
             f"[bold]Route:[/] {result.route} (grade {result.grade:.2f}, attempts {result.attempts})"
         )

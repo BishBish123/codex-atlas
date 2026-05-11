@@ -393,3 +393,44 @@ class TestCodeSearchHitScoreAndText:
         # Non-empty text matching the chunk source.
         assert resp.citations[0].text == "def foo():\n    return 1\n"
         assert resp.citations[1].text == "def bar():\n    return 2\n"
+
+
+class TestStartupValidation:
+    """``validate_startup_config`` rejects unrunnable configs at startup.
+
+    Pre-fix the MCP server happily accepted a ``--store=postgres`` start
+    with no DSN and only blew up on the first tool call. Failing fast at
+    startup turns that into a clean error before any client connects.
+    """
+
+    def test_postgres_without_dsn_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ATLAS_STORE", "postgres")
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        with pytest.raises(RuntimeError, match="POSTGRES_DSN"):
+            mcp_server.validate_startup_config()
+
+    def test_postgres_with_dsn_passes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ATLAS_STORE", "postgres")
+        monkeypatch.setenv("POSTGRES_DSN", "postgresql://stub")
+        # Should not raise.
+        mcp_server.validate_startup_config()
+
+    def test_memory_without_dsn_passes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Memory mode never needs a DSN — the snapshot is read lazily.
+        monkeypatch.setenv("ATLAS_STORE", "memory")
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        mcp_server.validate_startup_config()
+
+    def test_default_backend_passes_without_dsn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Default ATLAS_STORE is memory — fresh checkout shouldn't need a DSN.
+        monkeypatch.delenv("ATLAS_STORE", raising=False)
+        monkeypatch.delenv("POSTGRES_DSN", raising=False)
+        mcp_server.validate_startup_config()

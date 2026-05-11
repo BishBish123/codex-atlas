@@ -379,6 +379,31 @@ def codebase_stats() -> CodebaseStats:
     )
 
 
+def validate_startup_config() -> None:
+    """Reject unrunnable configurations BEFORE the MCP server opens a transport.
+
+    Without this check, a server started with ``--store=postgres`` and
+    no ``POSTGRES_DSN`` would happily accept the connect handshake from
+    its MCP client and only blow up on the first ``search_code`` /
+    ``explain`` / ``find_callers`` tool call — at which point the
+    client sees an opaque ``RuntimeError: POSTGRES_DSN env var is
+    required``. Failing fast at startup turns that into a clean,
+    actionable error before any tool is invoked.
+
+    Memory mode does not require this check at startup because the
+    snapshot is read lazily; a missing snapshot will surface the same
+    ``FileNotFoundError`` whether we check now or on first use, and the
+    error message already points at ``atlas index --store=memory``.
+    """
+    backend = _store_backend()
+    if backend == "postgres" and not os.environ.get("POSTGRES_DSN"):
+        raise RuntimeError(
+            "atlas-mcp --store=postgres requires POSTGRES_DSN to be set "
+            "(e.g. postgresql://bench:bench@localhost:5433/bench). "
+            "Either export POSTGRES_DSN or run with --store=memory."
+        )
+
+
 # ---------------------------------------------------------------------------
 # CLI entry
 # ---------------------------------------------------------------------------
@@ -394,6 +419,10 @@ def run(
     port: int = typer.Option(8090, help="HTTP bind port."),
 ) -> None:
     """Run the Codex-Atlas MCP server."""
+    # Fail-fast on unrunnable configs (e.g. postgres backend with no DSN)
+    # before opening a transport, so clients never see the misconfig
+    # surface as an opaque per-tool-call error.
+    validate_startup_config()
     if transport == "stdio":
         asyncio.run(mcp.run_stdio_async())
     elif transport == "http":

@@ -470,8 +470,18 @@ def mcp(
     os.environ["ATLAS_CHUNKS_PATH"] = str(chunks_path)
 
     from codex_atlas.mcp_server import mcp as mcp_app  # noqa: PLC0415
+    from codex_atlas.mcp_server import validate_startup_config  # noqa: PLC0415
 
     with _command_wrapper():
+        # Fail-fast: same check ``atlas-mcp run`` does, surfaced through
+        # the wrapper command too. Map a config error to exit 2 instead
+        # of letting the wrapper turn it into the generic "internal
+        # error" exit 1.
+        try:
+            validate_startup_config()
+        except RuntimeError as e:
+            _bail(str(e), e)
+
         if transport == "stdio":
             asyncio.run(mcp_app.run_stdio_async())
         elif transport == "http":

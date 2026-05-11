@@ -47,7 +47,7 @@ The whole thing is wrapped as a FastMCP server with 7 tools + 1 resource:
                    ┌─ MCP client (Claude Code / Cursor / Inspector)
                    ▼
              ┌────────────┐
-             │ FastMCP    │  4 tools, Pydantic-typed
+             │ FastMCP    │  7 tools + 1 resource, Pydantic-typed
              └──────┬─────┘
                     ▼
          ┌──────────────────────────┐
@@ -167,7 +167,7 @@ src/codex_atlas/
   store.py        Async pgvector adapter (asyncpg + pgvector-py)
   retriever.py    Heuristic classifier + 4-route retriever
   agent.py        State machine: classify → retrieve → grade → rewrite → answer
-  mcp_server.py   FastMCP wrapping 4 tools
+  mcp_server.py   FastMCP wrapping 7 tools + 1 resource
   cli.py          `atlas index | ask | eval`
   eval/           Golden set + harness + render_report
 

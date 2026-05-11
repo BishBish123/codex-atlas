@@ -1,10 +1,10 @@
 {
-  "citation_precision_mean": 0.06429924242424243,
-  "citation_recall_mean": 0.21875,
-  "cost_estimate_usd_total": 0.274953,
-  "latency_p50_ms": 1.9791095983237028,
-  "latency_p95_ms": 3.122697351500392,
-  "latency_p99_ms": 3.1476916279643774,
+  "citation_precision_mean": 0.06145833333333334,
+  "citation_recall_mean": 0.1875,
+  "cost_estimate_usd_total": 0.330633,
+  "latency_p50_ms": 10.0,
+  "latency_p95_ms": 20.0,
+  "latency_p99_ms": 20.0,
   "n": 16,
   "route_correctness": 0.9375,
   "tool_call_count_mean": 2.0

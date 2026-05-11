@@ -137,7 +137,7 @@ The 16-question golden set runs `atlas eval` against this repo's own `src/` (a h
 | --- | ---: |
 | Route correctness | 93.8% |
 | Citation recall (mean, structural) | 0.67 |
-| p50 latency (ms) | 2.0 |
+| p50 latency (ms) | <10 |
 
 The lookup / hybrid / summarization recall is intentionally measured with `FakeEncoder` (deterministic blake2b — no model download required). With a real `BAAI/bge-small-en-v1.5` encoder, those numbers jump significantly. The harness is wired to take any `Encoder` Protocol implementation, so swapping is one line.
 

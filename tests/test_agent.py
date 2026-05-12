@@ -146,3 +146,35 @@ class TestDefaults:
         assert "m.x0" in out
         assert "m.x1" in out
         assert "m.x9" not in out
+
+    async def test_stitch_synthesizer_renders_repo_relative_path(
+        self, tmp_path: object, monkeypatch: object  # type: ignore[no-untyped-def]
+    ) -> None:
+        # When the chunk's file_path lives under cwd, the synthesiser must
+        # render the path repo-relative so REPORT.md / answer text don't
+        # leak absolute /Users/<dev>/... prefixes.
+        import os as _os  # noqa: PLC0415
+
+        # Build a chunk whose file_path is under whatever cwd we set.
+        cwd = tmp_path  # type: ignore[assignment]
+        sub = cwd / "src" / "codex_atlas"  # type: ignore[operator]
+        sub.mkdir(parents=True)
+        abs_path = sub / "agent.py"
+        abs_path.write_text("def fn(): ...\n")
+        monkeypatch.chdir(cwd)  # type: ignore[attr-defined]
+
+        chunk = StoredChunk(
+            chunk_id="x",
+            qualified_name="codex_atlas.agent.fn",
+            file_path=str(abs_path),
+            lineno_start=1,
+            lineno_end=1,
+            kind=SymbolKind.FUNCTION,
+            text="def fn(): ...\n",
+            score=1.0,
+        )
+        synth = StitchSynthesizer()
+        out = await synth.synthesize("q", [chunk])
+        # Absolute path must not appear; relative form must.
+        assert str(abs_path) not in out
+        assert _os.path.join("src", "codex_atlas", "agent.py") in out

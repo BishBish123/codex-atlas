@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from collections.abc import Coroutine
@@ -431,6 +432,30 @@ class CitationValidator:
         return False
 
 
+def _display_path(file_path: str) -> str:
+    """Render ``file_path`` repo-relative when it lives inside ``cwd``.
+
+    The indexer stores absolute paths so chunks survive a process moving
+    cwd; the eval REPORT.md and the synthesiser-rendered answer text
+    are read by humans and should not bleed
+    ``/Users/<dev>/projects/...`` prefixes. ``os.path.relpath`` is the
+    surgical fix per the UX review: when the path is under cwd we shrink
+    it to the repo-relative form (``src/codex_atlas/agent.py``);
+    otherwise we leave it alone.
+    """
+    try:
+        rel = os.path.relpath(file_path, start=os.getcwd())
+    except ValueError:
+        # Different drive on Windows; relpath raises rather than crossing.
+        return file_path
+    # ``relpath`` keeps walking up with ``..`` for paths outside cwd.
+    # If the relative form is longer or starts with ``..`` we're better
+    # off keeping the absolute form — it's at least unambiguous.
+    if rel.startswith("..") or len(rel) >= len(file_path):
+        return file_path
+    return rel
+
+
 @dataclass(frozen=True)
 class StitchSynthesizer:
     """Concatenate the top chunks into a markdown answer with inline cites.
@@ -450,7 +475,10 @@ class StitchSynthesizer:
             )
         lines = [f"# {query}", ""]
         for c in chunks[: self.max_chunks]:
-            lines.append(f"## `{c.qualified_name}` ({c.file_path}:{c.lineno_start}-{c.lineno_end})")
+            shown = _display_path(c.file_path)
+            lines.append(
+                f"## `{c.qualified_name}` ({shown}:{c.lineno_start}-{c.lineno_end})"
+            )
             lines.append("```python")
             lines.append(c.text.rstrip())
             lines.append("```")

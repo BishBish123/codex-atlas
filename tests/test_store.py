@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from codex_atlas.indexer.ast_parser import Chunk, SymbolKind
-from codex_atlas.store import ChunkStore, InMemoryChunkStore
+from codex_atlas.store import ChunkStore, CorruptedChunkStoreError, InMemoryChunkStore
 
 
 class _FakeConnection:
@@ -680,6 +680,72 @@ class TestInMemoryStorePersistence:
         # And no orphan tempfile next to the snapshot.
         siblings = sorted(p.name for p in tmp_path.iterdir())
         assert siblings == ["chunks.json"], siblings
+
+    async def test_load_raises_on_truncated_json(self, tmp_path: Any) -> None:
+        """A half-written file (e.g. a power-loss snapshot) raises a typed error.
+
+        Before the typed-error refit, ``load_from_path`` let the bare
+        ``json.JSONDecodeError`` bubble straight to the CLI top level,
+        producing a stack trace rather than an actionable message. The
+        new contract: detect it, wrap it, point the caller at
+        ``atlas index --store=memory``.
+        """
+        path = tmp_path / "chunks.json"
+        # Truncate a real-looking payload mid-key. The previous
+        # implementation would have stopped at the JSONDecodeError.
+        path.write_text('{"dim": 8, "chunks": [{"chunk_id": "a", ')
+        with pytest.raises(CorruptedChunkStoreError, match="atlas index"):
+            await InMemoryChunkStore.load_from_path(path)
+
+    async def test_load_raises_on_unknown_schema_keys(self, tmp_path: Any) -> None:
+        """Missing required keys / wrong types yield ``CorruptedChunkStoreError``.
+
+        The schema is implicit (positional dict access in
+        ``load_from_path``); validating it explicitly here pins the
+        contract so a future schema bump can't quietly load a
+        partially-populated store.
+        """
+        path = tmp_path / "chunks.json"
+        # Valid JSON, but ``dim`` is a string and ``chunks`` lacks
+        # ``qualified_name`` — both used to raise raw ValueError /
+        # KeyError.
+        path.write_text(
+            '{"dim": "not-an-int", "chunks": [{"chunk_id": "a"}]}'
+        )
+        with pytest.raises(CorruptedChunkStoreError, match="atlas index"):
+            await InMemoryChunkStore.load_from_path(path)
+
+        # Missing ``chunks`` key entirely.
+        path.write_text('{"dim": 8}')
+        with pytest.raises(CorruptedChunkStoreError, match="atlas index"):
+            await InMemoryChunkStore.load_from_path(path)
+
+        # Unknown SymbolKind — the str-to-enum coercion used to raise
+        # raw ValueError. Now wrapped.
+        path.write_text(
+            '{"dim": 4, "chunks": [{"chunk_id": "a", "qualified_name": "m.a", '
+            '"file_path": "f.py", "lineno_start": 1, "lineno_end": 2, '
+            '"kind": "alien_kind", "text": "x", "vector": [0,0,0,0]}]}'
+        )
+        with pytest.raises(CorruptedChunkStoreError, match="atlas index"):
+            await InMemoryChunkStore.load_from_path(path)
+
+    async def test_load_succeeds_on_valid_round_trip(self, tmp_path: Any) -> None:
+        """Sanity: the typed-error wrapper doesn't break the happy path."""
+        store = InMemoryChunkStore()
+        await store.setup(dim=4)
+        await store.upsert_chunks(
+            [_chunk("m.fn_0", 0)],
+            np.eye(1, 4, dtype=np.float32),
+        )
+        path = tmp_path / "chunks.json"
+        await store.save_to_path(path)
+
+        # Round-trip cleanly — no CorruptedChunkStoreError.
+        loaded = await InMemoryChunkStore.load_from_path(path)
+        row = await loaded.fetch_by_qualified_name("m.fn_0")
+        assert row is not None
+        assert row.qualified_name == "m.fn_0"
 
     async def test_save_to_path_handles_concurrent_writers(self, tmp_path: Any) -> None:
         """Two concurrent ``save_to_path`` calls both succeed; final file is intact.

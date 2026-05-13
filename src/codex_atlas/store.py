@@ -41,6 +41,18 @@ from codex_atlas.indexer.ast_parser import Chunk, SymbolKind
 _TABLE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
 
+class CorruptedChunkStoreError(RuntimeError):
+    """Raised when ``InMemoryChunkStore.load_from_path`` finds a malformed snapshot.
+
+    The on-disk JSON exists but its bytes are unparseable, missing
+    required keys, or contain values of the wrong shape (e.g. a
+    string where an int is required, or an unknown ``SymbolKind``).
+    The error message instructs the caller to rebuild the snapshot
+    rather than to attempt a recovery — partial loads silently
+    poison every downstream search ranking.
+    """
+
+
 @dataclass(frozen=True)
 class StoredChunk:
     """A retrieved chunk with its similarity score."""
@@ -550,29 +562,55 @@ class InMemoryChunkStore:
 
     @classmethod
     async def load_from_path(cls, path: str | Path) -> InMemoryChunkStore:
-        """Build an ``InMemoryChunkStore`` from a JSON file written by ``save_to_path``."""
+        """Build an ``InMemoryChunkStore`` from a JSON file written by ``save_to_path``.
+
+        Raises ``FileNotFoundError`` when the snapshot is missing.
+        Raises ``CorruptedChunkStoreError`` when the file is present
+        but unparseable, missing required keys, or contains values of
+        the wrong shape (e.g. a non-numeric ``dim``, a missing
+        ``vector`` field, or an unknown ``kind``). The error message
+        names the offending path and tells the caller to rerun
+        ``atlas index --store=memory`` to rebuild — partial loads
+        would silently poison search rankings, so we refuse them.
+        """
         src = Path(path)
         if not src.exists():  # noqa: ASYNC240
             raise FileNotFoundError(
                 f"in-memory chunk store snapshot not found at {src}; "
                 f"run `atlas index --store=memory` first"
             )
-        payload = json.loads(src.read_text())  # noqa: ASYNC240
-        dim = int(payload["dim"])
-        store = cls()
-        await store.setup(dim=dim)
-        async with store._lock:
-            for entry in payload["chunks"]:
-                cid = str(entry["chunk_id"])
-                store._rows[cid] = StoredChunk(
-                    chunk_id=cid,
-                    qualified_name=str(entry["qualified_name"]),
-                    file_path=str(entry["file_path"]),
-                    lineno_start=int(entry["lineno_start"]),
-                    lineno_end=int(entry["lineno_end"]),
-                    kind=SymbolKind(entry["kind"]),
-                    text=str(entry["text"]),
-                    score=1.0,
+        try:
+            raw = src.read_text()  # noqa: ASYNC240
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"snapshot root must be a JSON object, got {type(payload).__name__}"
                 )
-                store._vectors[cid] = np.asarray(entry["vector"], dtype=np.float32)
+            dim = int(payload["dim"])
+            entries = payload["chunks"]
+            if not isinstance(entries, list):
+                raise ValueError(
+                    f"`chunks` must be a list, got {type(entries).__name__}"
+                )
+            store = cls()
+            await store.setup(dim=dim)
+            async with store._lock:
+                for entry in entries:
+                    cid = str(entry["chunk_id"])
+                    store._rows[cid] = StoredChunk(
+                        chunk_id=cid,
+                        qualified_name=str(entry["qualified_name"]),
+                        file_path=str(entry["file_path"]),
+                        lineno_start=int(entry["lineno_start"]),
+                        lineno_end=int(entry["lineno_end"]),
+                        kind=SymbolKind(entry["kind"]),
+                        text=str(entry["text"]),
+                        score=1.0,
+                    )
+                    store._vectors[cid] = np.asarray(entry["vector"], dtype=np.float32)
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+            raise CorruptedChunkStoreError(
+                f"snapshot at {src} is corrupt or malformed ({exc}); "
+                f"rerun `atlas index --store=memory` to rebuild"
+            ) from exc
         return store

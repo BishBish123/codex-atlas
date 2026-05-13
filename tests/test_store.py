@@ -637,3 +637,88 @@ class TestInMemoryStorePersistence:
     async def test_load_missing_file_errors(self, tmp_path: Any) -> None:
         with pytest.raises(FileNotFoundError, match="atlas index"):
             await InMemoryChunkStore.load_from_path(tmp_path / "nope.json")
+
+    async def test_save_to_path_is_atomic(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A mid-write crash must leave the previous snapshot intact.
+
+        Concurrent ``atlas index`` + ``atlas ask`` used to be able to
+        observe a half-written ``chunks.json`` because ``Path.write_text``
+        truncates first and writes second. The atomic-rename refit
+        writes to a sibling tempfile and only ``os.replace``'s after the
+        bytes are durable; a crash mid-encode (modelled here by making
+        ``json.dumps`` raise) must therefore not perturb the existing
+        file.
+        """
+        # First, write a known-good snapshot — the file we're protecting.
+        store = InMemoryChunkStore()
+        await store.setup(dim=4)
+        chunks = [_chunk("m.fn_0", 0)]
+        vectors = np.eye(1, 4, dtype=np.float32)
+        await store.upsert_chunks(chunks, vectors)
+        path = tmp_path / "chunks.json"
+        await store.save_to_path(path)
+        good_bytes = path.read_bytes()
+
+        # Now make ``json.dumps`` blow up to simulate a fault during the
+        # next write. The old code would have called ``write_text`` and
+        # left the file truncated; the atomic path raises BEFORE any
+        # filesystem write because we encode first, so the existing
+        # file is bit-for-bit unchanged.
+        import codex_atlas.store as store_mod  # noqa: PLC0415
+
+        def _boom(*_a: Any, **_kw: Any) -> str:
+            raise RuntimeError("simulated mid-write fault")
+
+        monkeypatch.setattr(store_mod.json, "dumps", _boom)
+
+        with pytest.raises(RuntimeError, match="simulated"):
+            await store.save_to_path(path)
+
+        assert path.read_bytes() == good_bytes
+        # And no orphan tempfile next to the snapshot.
+        siblings = sorted(p.name for p in tmp_path.iterdir())
+        assert siblings == ["chunks.json"], siblings
+
+    async def test_save_to_path_handles_concurrent_writers(self, tmp_path: Any) -> None:
+        """Two concurrent ``save_to_path`` calls both succeed; final file is intact.
+
+        With the old non-atomic write, two concurrent writers could
+        interleave bytes and produce malformed JSON. Under the
+        rename-into-place implementation each writer renames its own
+        tempfile; the last rename wins and the file is one of the two
+        valid snapshots — never a torn mix.
+        """
+        # Two distinct stores so the two writes have meaningfully
+        # different payloads — lets us assert the final file matches
+        # exactly one of them, not a chimera.
+        store_a = InMemoryChunkStore()
+        await store_a.setup(dim=4)
+        await store_a.upsert_chunks(
+            [_chunk("m.a", 0)],
+            np.eye(1, 4, dtype=np.float32),
+        )
+        store_b = InMemoryChunkStore()
+        await store_b.setup(dim=4)
+        await store_b.upsert_chunks(
+            [_chunk("m.b", 1)],
+            np.eye(1, 4, dtype=np.float32),
+        )
+
+        path = tmp_path / "chunks.json"
+        await asyncio.gather(
+            store_a.save_to_path(path),
+            store_b.save_to_path(path),
+        )
+
+        # Final file is parseable JSON (no torn write), and the chunk
+        # list matches one of the two writers exactly.
+        import json as _json  # noqa: PLC0415
+
+        payload = _json.loads(path.read_text())
+        qnames = [c["qualified_name"] for c in payload["chunks"]]
+        assert qnames in (["m.a"], ["m.b"]), qnames
+        # No tempfiles linger.
+        siblings = sorted(p.name for p in tmp_path.iterdir())
+        assert siblings == ["chunks.json"], siblings

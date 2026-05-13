@@ -17,8 +17,11 @@ would just hold idle connections.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import re
+import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -479,6 +482,16 @@ class InMemoryChunkStore:
         forcing every ``ask`` / ``search`` to reindex inline. We dump
         rows + vectors + dim to disk so the next CLI invocation can
         ``load_from_path`` and serve queries with no DB.
+
+        Crash- and concurrency-safe: the payload is written to a
+        sibling tempfile (``<path>.tmp.<pid>.<ts>``), ``fsync``'d, then
+        ``os.replace``'d into place. Readers either see the previous
+        complete snapshot or the new complete snapshot — never the
+        truncated mid-write JSON that ``Path.write_text`` would leave
+        behind on a process crash or a concurrent writer interleave.
+        Two concurrent writers each rename their own tempfile; the last
+        rename wins and the loser's tempfile is silently superseded
+        (``os.replace`` is atomic on POSIX and Windows).
         """
         if self._dim is None:
             raise RuntimeError("save_to_path() called before setup()")
@@ -503,8 +516,36 @@ class InMemoryChunkStore:
             }
         # The CLI is the sole caller (one-shot write at end of `atlas
         # index`); blocking I/O here is fine and matches the pattern
-        # already used by ``CallGraph.save``. Suppress ASYNC240 here only.
-        out.write_text(json.dumps(payload))  # noqa: ASYNC240
+        # already used by ``CallGraph.save``.
+        # Build the JSON eagerly so a serialisation error (e.g. NaN in a
+        # vector) raises BEFORE we touch the filesystem — leaves the
+        # previous snapshot untouched.
+        encoded = json.dumps(payload)
+        # Sibling tempfile keeps the rename on the same filesystem so
+        # ``os.replace`` is guaranteed atomic. PID + monotonic ns
+        # disambiguates concurrent writers in the same process AND
+        # across processes.
+        tmp_path = out.with_name(f"{out.name}.tmp.{os.getpid()}.{time.monotonic_ns()}")
+        try:
+            fd = os.open(
+                tmp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o644,
+            )
+            try:
+                os.write(fd, encoded.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp_path, out)
+        except BaseException:
+            # Best-effort cleanup so a failed write doesn't leak the
+            # tempfile next to the snapshot. ``missing_ok`` swallows the
+            # already-renamed case where ``os.replace`` succeeded but a
+            # later step (there isn't one today, but defensively) raised.
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            raise
         return out
 
     @classmethod

@@ -310,6 +310,11 @@ class TestExplainForcesStructuralRoute:
         from codex_atlas.retriever import Route as _Route  # noqa: PLC0415
 
         assert captured["route_override"] == _Route.STRUCTURAL
+        # And it must pass the BARE qualified name — no "who calls X"
+        # rewrite. Under STRUCTURAL the rewrite was dead weight (the
+        # extractor only needs the qname token); dropping it also keeps
+        # the synthesizer's H1 header tidy.
+        assert captured["query"] == "a.foo"
 
 
 class TestMcpStartupFailFast:

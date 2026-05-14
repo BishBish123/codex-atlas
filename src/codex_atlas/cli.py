@@ -431,6 +431,15 @@ def explain(
     (vector-only) when the heuristic missed the "who calls" prefix.
     The structural route walks the call graph directly, which is what
     every ``explain`` caller actually wants.
+
+    Query: passed straight through as the bare ``qualified_name``. The
+    structural extractor (``_extract_qualified_name``) only needs the
+    qname token and ignores any prefix — the previous "who calls X"
+    rewrite was inherited from the era when the classifier had to see
+    the keyword phrase to pick the route. With ``route_override`` doing
+    that selection up-front, the rewrite is dead weight; dropping it
+    also produces a cleaner answer header (``# pkg.mod.fn`` vs
+    ``# who calls pkg.mod.fn``) in the synth output.
     """
 
     async def _run() -> None:
@@ -444,7 +453,7 @@ def explain(
         retriever = Retriever(encoder_obj, store, cg, RetrieverConfig(top_k=8))
         agent = Agent(retriever)
         result = await agent.run(
-            f"who calls {qualified_name}",
+            qualified_name,
             route_override=Route.STRUCTURAL,
         )
         console.print(

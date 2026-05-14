@@ -8,11 +8,11 @@
 | Route correctness | 93.8% |
 | Citation recall (mean) | 0.19 |
 | Citation precision (mean) | 0.06 |
-| p50 latency (ms) | 2.5 |
-| p95 latency (ms) | 4.5 |
-| p99 latency (ms) | 4.5 |
+| p50 latency (ms) | 2.7 |
+| p95 latency (ms) | 4.9 |
+| p99 latency (ms) | 5.0 |
 | Tool calls / q (mean) | 2.00 |
-| Cost estimate (USD, total) | 0.3248 |
+| Cost estimate (USD, total) | 0.3556 |
 
 ## By category
 
@@ -43,19 +43,19 @@
 
 | qid | route ok | recall | prec | ms | tools | bucket | preview |
 | --- | :---: | ---: | ---: | ---: | ---: | --- | --- |
-| lookup-1 | yes | 0.00 | 0.00 | 4.5 | 3 | off_topic | # what does Encoder do (in this codebase, with code-level detail)  ## `codex_atl |
-| lookup-2 | yes | 0.00 | 0.00 | 4.3 | 3 | off_topic | # explain how chunk_id is constructed (in this codebase, with code-level detail) |
-| lookup-3 | yes | 0.00 | 0.00 | 4.2 | 3 | off_topic | # how does the heuristic grader score retrieval (in this codebase, with code-lev |
+| lookup-1 | yes | 0.00 | 0.00 | 5.1 | 3 | off_topic | # what does Encoder do (in this codebase, with code-level detail)  ## `codex_atl |
+| lookup-2 | yes | 0.00 | 0.00 | 4.8 | 3 | off_topic | # explain how chunk_id is constructed (in this codebase, with code-level detail) |
+| lookup-3 | yes | 0.00 | 0.00 | 4.5 | 3 | off_topic | # how does the heuristic grader score retrieval (in this codebase, with code-lev |
 | structural-1 | yes | 1.00 | 0.33 | 0.9 | 1 | hallucinated | # who calls find_callers  ## `codex_atlas.indexer.graph.CallGraph._traverse` (sr |
-| structural-2 | yes | 1.00 | 0.40 | 0.7 | 1 | hallucinated | # who calls _extract_qualified_name  ## `codex_atlas.indexer.graph.CallGraph.has |
-| structural-3 | yes | 0.00 | 0.00 | 1.9 | 1 | off_topic | # callers of register_async  ## `codex_atlas.indexer.ast_parser._Collector._hand |
-| hybrid-1 | no | 0.00 | 0.00 | 4.5 | 3 | wrong_route | # show me all retriever-related code (in this codebase, with code-level detail)  |
-| hybrid-2 | yes | 0.00 | 0.00 | 4.0 | 1 | off_topic | # end-to-end indexing pipeline  ## `codex_atlas.cli.ask` (src/codex_atlas/cli.py |
-| summary-1 | yes | 0.00 | 0.00 | 2.6 | 1 | off_topic | # walk me through the agent loop  ## `codex_atlas.store.InMemoryChunkStore.fetch |
-| summary-2 | yes | 0.00 | 0.00 | 2.4 | 1 | off_topic | # overview of the indexer module  ## `codex_atlas.mcp_server._graph` (src/codex_ |
-| neighborhood-1 | yes | 1.00 | 0.25 | 0.4 | 1 | hallucinated | # neighborhood of codex_atlas.indexer.graph.CallGraph.find_callers  ## `codex_at |
-| neighborhood-2 | yes | 0.00 | 0.00 | 0.5 | 1 | off_topic | # everything around codex_atlas.retriever.Retriever.retrieve  ## `codex_atlas.ag |
+| structural-2 | yes | 1.00 | 0.40 | 0.6 | 1 | hallucinated | # who calls _extract_qualified_name  ## `codex_atlas.indexer.graph.CallGraph.has |
+| structural-3 | yes | 0.00 | 0.00 | 1.8 | 1 | off_topic | # callers of register_async  ## `codex_atlas.indexer.ast_parser._Collector._hand |
+| hybrid-1 | no | 0.00 | 0.00 | 4.2 | 3 | wrong_route | # show me all retriever-related code (in this codebase, with code-level detail)  |
+| hybrid-2 | yes | 0.00 | 0.00 | 4.3 | 1 | off_topic | # end-to-end indexing pipeline  ## `codex_atlas.cli.ask` (src/codex_atlas/cli.py |
+| summary-1 | yes | 0.00 | 0.00 | 2.7 | 1 | off_topic | # walk me through the agent loop  ## `codex_atlas.store.InMemoryChunkStore.fetch |
+| summary-2 | yes | 0.00 | 0.00 | 2.7 | 1 | off_topic | # overview of the indexer module  ## `codex_atlas.mcp_server._graph` (src/codex_ |
+| neighborhood-1 | yes | 1.00 | 0.25 | 0.5 | 1 | hallucinated | # neighborhood of codex_atlas.indexer.graph.CallGraph.find_callers  ## `codex_at |
+| neighborhood-2 | yes | 0.00 | 0.00 | 0.6 | 1 | off_topic | # everything around codex_atlas.retriever.Retriever.retrieve  ## `codex_atlas.ag |
 | import-chain-1 | yes | 0.00 | 0.00 | 0.2 | 3 | ungrounded | I could not find any relevant code chunks for that query in the indexed corpus.  |
-| import-chain-2 | yes | 0.00 | 0.00 | 0.1 | 3 | ungrounded | I could not find any relevant code chunks for that query in the indexed corpus.  |
-| refusal-1 | yes | 0.00 | 0.00 | 3.6 | 3 | off_topic | # what does frobnicate_widget do (in this codebase, with code-level detail)  ##  |
-| oos-1 | yes | 0.00 | 0.00 | 3.4 | 3 | off_topic | # how do I deploy this to AWS Lambda (in this codebase, with code-level detail)  |
+| import-chain-2 | yes | 0.00 | 0.00 | 0.2 | 3 | ungrounded | I could not find any relevant code chunks for that query in the indexed corpus.  |
+| refusal-1 | yes | 0.00 | 0.00 | 4.3 | 3 | off_topic | # what does frobnicate_widget do (in this codebase, with code-level detail)  ##  |
+| oos-1 | yes | 0.00 | 0.00 | 4.5 | 3 | off_topic | # how do I deploy this to AWS Lambda (in this codebase, with code-level detail)  |

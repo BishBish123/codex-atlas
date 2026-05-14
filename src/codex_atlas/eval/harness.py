@@ -460,6 +460,11 @@ _LOWER_IS_BETTER: frozenset[str] = frozenset(
 )
 
 
+_LATENCY_METRICS: frozenset[str] = frozenset(
+    {"latency_p50_ms", "latency_p95_ms", "latency_p99_ms"}
+)
+
+
 def evaluate_against_baseline(
     current: list[EvalResult],
     baseline_path: str | Path,
@@ -472,11 +477,30 @@ def evaluate_against_baseline(
     a metric that drops by less than 5% of its baseline doesn't count as
     a regression. This keeps the CI gate from blocking on noise while
     still surfacing real drift.
+
+    Latency tolerance has an extra absolute floor: when the baseline
+    JSON includes a ``latency_tolerance_ms`` field, every
+    ``latency_p*_ms`` metric is allowed to drift by up to that many
+    milliseconds in addition to the proportional ``tolerance`` band.
+    Without it, a baseline pinned at single-digit milliseconds would
+    flag a 1ms wall-clock jitter (~25% of 4.5ms) as a regression on
+    every busy CI runner.
     """
     baseline = json.loads(Path(baseline_path).read_text())
     cur = aggregate(current)
     regressions: dict[str, tuple[float, float]] = {}
     improvements: dict[str, tuple[float, float]] = {}
+    # Optional absolute-ms slack for latency metrics. Anything else
+    # ignores it — only latency is jittery enough to need an absolute
+    # floor on top of the proportional band.
+    latency_floor_ms = float(baseline.get("latency_tolerance_ms", 0.0) or 0.0)
+
+    def _slack(metric: str, baseline_value: float) -> float:
+        proportional = tolerance * max(abs(baseline_value), 1e-9)
+        if metric in _LATENCY_METRICS and latency_floor_ms > 0.0:
+            return max(proportional, latency_floor_ms)
+        return proportional
+
     # Only diff metrics the baseline actually recorded — you can't regress
     # against a number you didn't measure.
     for metric in _HIGHER_IS_BETTER:
@@ -484,18 +508,20 @@ def evaluate_against_baseline(
             continue
         b = float(baseline[metric])
         c = float(cur.get(metric, 0.0))
-        if c < b - tolerance * max(abs(b), 1e-9):
+        s = _slack(metric, b)
+        if c < b - s:
             regressions[metric] = (b, c)
-        elif c > b + tolerance * max(abs(b), 1e-9):
+        elif c > b + s:
             improvements[metric] = (b, c)
     for metric in _LOWER_IS_BETTER:
         if metric not in baseline:
             continue
         b = float(baseline[metric])
         c = float(cur.get(metric, 0.0))
-        if c > b + tolerance * max(abs(b), 1e-9):
+        s = _slack(metric, b)
+        if c > b + s:
             regressions[metric] = (b, c)
-        elif c < b - tolerance * max(abs(b), 1e-9):
+        elif c < b - s:
             improvements[metric] = (b, c)
     return BaselineDiff(
         regressions=regressions,

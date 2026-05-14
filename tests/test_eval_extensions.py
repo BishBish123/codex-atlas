@@ -226,6 +226,54 @@ class TestBaselineRegression:
         # 2% slower with 10% tolerance is fine.
         assert not diff.is_regression
 
+    def test_latency_tolerance_ms_floor_absorbs_jitter(self, tmp_path: Path) -> None:
+        """A 5ms absolute floor stops 1ms wall-clock jitter on tiny latencies.
+
+        Without ``latency_tolerance_ms``, a baseline pinned at 4.5ms
+        with a 5% proportional tolerance only allows ~0.225ms of
+        drift — every busy CI runner trips the gate. The absolute
+        floor is the escape valve.
+        """
+        baseline = {"latency_p50_ms": 4.5, "latency_tolerance_ms": 5.0}
+        baseline_path = tmp_path / "baseline.json"
+        baseline_path.write_text(json.dumps(baseline))
+        # Current run is ~2x slower (4.5 -> 9.0). Without the absolute
+        # floor that's a regression at any sane proportional tolerance;
+        # with a 5ms floor it's still inside the slack band.
+        q = _q(gold=["m.foo"])
+        results = [score_result(q, _agent_result(citations=[_cite("m.foo")]), latency_ms=9.0)]
+        diff = evaluate_against_baseline(results, baseline_path, tolerance=0.05)
+        assert not diff.is_regression
+        # And a clearly-regressed value (15ms) trips it even with the floor.
+        results_bad = [
+            score_result(q, _agent_result(citations=[_cite("m.foo")]), latency_ms=15.0)
+        ]
+        diff_bad = evaluate_against_baseline(results_bad, baseline_path, tolerance=0.05)
+        assert diff_bad.is_regression
+        assert "latency_p50_ms" in diff_bad.regressions
+
+    def test_latency_tolerance_ms_does_not_apply_to_non_latency(
+        self, tmp_path: Path
+    ) -> None:
+        """The absolute floor must NOT leak into route_correctness / cost / tools."""
+        baseline = {
+            "route_correctness": 1.0,
+            "cost_estimate_usd_total": 0.10,
+            "latency_tolerance_ms": 5.0,
+        }
+        baseline_path = tmp_path / "baseline.json"
+        baseline_path.write_text(json.dumps(baseline))
+        # 50% correct — should still regress regardless of the latency floor.
+        q_ok = _q(gold=["m.foo"])
+        q_wrong = _q(gold=["m.foo"], expected=ExpectedRoute.STRUCTURAL)
+        results = [
+            score_result(q_ok, _agent_result(citations=[_cite("m.foo")]), latency_ms=1.0),
+            score_result(q_wrong, _agent_result(citations=[_cite("m.foo")]), latency_ms=1.0),
+        ]
+        diff = evaluate_against_baseline(results, baseline_path, tolerance=0.0)
+        assert diff.is_regression
+        assert "route_correctness" in diff.regressions
+
 
 class TestFailureReportJsonl:
     def test_writes_one_line_per_question(self, tmp_path: Path) -> None:

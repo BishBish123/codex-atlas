@@ -21,6 +21,7 @@ from codex_atlas.agent import Agent
 from codex_atlas.embed import Encoder, FakeEncoder
 from codex_atlas.eval.golden import load_golden_set
 from codex_atlas.eval.harness import (
+    aggregate,
     evaluate_against_baseline,
     render_report,
     run_eval,
@@ -517,6 +518,12 @@ def eval_cmd(  # noqa: PLR0915
         "--baseline",
         help="Path to baseline JSON (aggregate metrics). Exits non-zero on regression.",
     ),
+    baseline_out: Path | None = typer.Option(
+        None,
+        "--baseline-out",
+        help="Write the aggregate metrics of this run to a baseline JSON file. "
+        "Use to refresh `evals/baseline.json` after material code changes.",
+    ),
     tolerance: float = typer.Option(
         0.05, help="Fractional tolerance for the baseline regression gate."
     ),
@@ -540,7 +547,7 @@ def eval_cmd(  # noqa: PLR0915
 ) -> None:
     """Run the golden test set and write a markdown + (optional) JSON report."""
 
-    async def _run() -> None:  # noqa: PLR0912
+    async def _run() -> None:  # noqa: PLR0912, PLR0915
         encoder_obj = _resolve_encoder(encoder)
         # If --rebuild-graph is set, parse the corpus and (re)write the
         # graph file BEFORE we try to load it. This is the explicit
@@ -617,6 +624,25 @@ def eval_cmd(  # noqa: PLR0915
         if failure_report is not None:
             write_failure_report(results, failure_report)
             console.print(f"[green]wrote[/] {failure_report}")
+        if baseline_out is not None:
+            # Write the aggregate metrics as the canonical baseline.
+            # Pin a 5ms absolute slack on latency percentiles so the CI
+            # gate doesn't flag wall-clock jitter on hot CPUs (single-
+            # digit-ms latencies move ~25% from one run to the next).
+            baseline_payload: dict[str, object] = {
+                "_comment": (
+                    "Real measurements from the canonical "
+                    "`atlas eval --store=memory` run against the "
+                    "bundled corpus. Re-generate after material code "
+                    "changes with `atlas eval --store=memory "
+                    "--baseline-out evals/baseline.json`."
+                ),
+                "latency_tolerance_ms": 5.0,
+                **aggregate(results),
+            }
+            baseline_out.parent.mkdir(parents=True, exist_ok=True)
+            baseline_out.write_text(json.dumps(baseline_payload, indent=2))
+            console.print(f"[green]wrote[/] {baseline_out}")
         if baseline is not None:
             try:
                 diff = evaluate_against_baseline(results, baseline, tolerance=tolerance)

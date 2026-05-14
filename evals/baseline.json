@@ -1,11 +1,13 @@
 {
-  "citation_precision_mean": 0.06145833333333334,
-  "citation_recall_mean": 0.1875,
-  "cost_estimate_usd_total": 0.330633,
-  "latency_p50_ms": 10.0,
-  "latency_p95_ms": 20.0,
-  "latency_p99_ms": 20.0,
+  "_comment": "Real measurements from the canonical `atlas eval --store=memory` run against the bundled corpus. Re-generate after material code changes with `atlas eval --store=memory --baseline-out evals/baseline.json`.",
+  "latency_tolerance_ms": 5.0,
   "n": 16,
   "route_correctness": 0.9375,
-  "tool_call_count_mean": 2.0
+  "citation_recall_mean": 0.1875,
+  "citation_precision_mean": 0.06145833333333334,
+  "latency_p50_ms": 2.6745793875306845,
+  "latency_p95_ms": 4.875556449405849,
+  "latency_p99_ms": 5.04063384141773,
+  "tool_call_count_mean": 2.0,
+  "cost_estimate_usd_total": 0.355638
 }

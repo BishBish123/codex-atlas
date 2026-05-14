@@ -7,7 +7,7 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 4.494665190577507,
+    "latency_ms": 5.0819031894207,
     "attempts": 3,
     "tool_call_count": 3,
     "cost_estimate_usd": 0.023595,
@@ -31,7 +31,7 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 4.306536167860031,
+    "latency_ms": 4.806774202734232,
     "attempts": 3,
     "tool_call_count": 3,
     "cost_estimate_usd": 0.013884,
@@ -42,9 +42,9 @@
       "codex_atlas.indexer.graph.CallGraph.find_callees",
       "codex_atlas.agent.StitchSynthesizer.synthesize",
       "codex_atlas.eval.harness._matches",
-      "codex_atlas.store.InMemoryChunkStore.load_from_path",
       "codex_atlas.cli.search._run",
-      "codex_atlas.store.InMemoryChunkStore.__init__"
+      "codex_atlas.store.InMemoryChunkStore.__init__",
+      "codex_atlas.mcp_server._graph"
     ]
   },
   {
@@ -55,7 +55,7 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 4.241508431732655,
+    "latency_ms": 4.494603257626295,
     "attempts": 3,
     "tool_call_count": 3,
     "cost_estimate_usd": 0.017942999999999997,
@@ -79,7 +79,7 @@
     "route_correct": true,
     "citation_recall": 1.0,
     "citation_precision": 0.3333333333333333,
-    "latency_ms": 0.9471671655774117,
+    "latency_ms": 0.8748471736907959,
     "attempts": 1,
     "tool_call_count": 1,
     "cost_estimate_usd": 0.015524999999999999,
@@ -101,7 +101,7 @@
     "route_correct": true,
     "citation_recall": 1.0,
     "citation_precision": 0.4,
-    "latency_ms": 0.6635617464780807,
+    "latency_ms": 0.607829075306654,
     "attempts": 1,
     "tool_call_count": 1,
     "cost_estimate_usd": 0.013179,
@@ -122,7 +122,7 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 1.8978551961481571,
+    "latency_ms": 1.847424078732729,
     "attempts": 1,
     "tool_call_count": 1,
     "cost_estimate_usd": 0.024843,
@@ -146,20 +146,20 @@
     "route_correct": false,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 4.4969189912080765,
+    "latency_ms": 4.214107058942318,
     "attempts": 3,
     "tool_call_count": 3,
-    "cost_estimate_usd": 0.015428999999999998,
+    "cost_estimate_usd": 0.035739,
     "failure_bucket": "wrong_route",
     "cited_qualified_names": [
+      "codex_atlas.cli.eval_cmd._run",
       "codex_atlas.agent._display_path",
       "codex_atlas.agent.CitationValidator.validate",
       "codex_atlas.agent.NoopRewriter.rewrite",
       "codex_atlas.embed.Encoder.encode",
       "codex_atlas.agent.HeuristicGrader.grade",
       "codex_atlas.agent.Validator.validate",
-      "codex_atlas.eval.harness.write_failure_report",
-      "codex_atlas.indexer.walker.parse_corpus"
+      "codex_atlas.eval.harness.write_failure_report"
     ]
   },
   {
@@ -170,20 +170,20 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 4.0245670825243,
+    "latency_ms": 4.298239015042782,
     "attempts": 1,
     "tool_call_count": 1,
-    "cost_estimate_usd": 0.06767099999999998,
+    "cost_estimate_usd": 0.045921,
     "failure_bucket": "off_topic",
     "cited_qualified_names": [
       "codex_atlas.cli.ask",
       "codex_atlas.cli.index",
       "codex_atlas.cli.search",
       "codex_atlas.cli.explain",
-      "codex_atlas.cli.eval_cmd",
       "codex_atlas.cli._resolve_encoder",
       "codex_atlas.indexer.graph.CallGraph.load",
-      "codex_atlas.cli._open_query_store"
+      "codex_atlas.cli._open_query_store",
+      "codex_atlas.cli.ask._run"
     ]
   },
   {
@@ -194,7 +194,7 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 2.6285829953849316,
+    "latency_ms": 2.656723838299513,
     "attempts": 1,
     "tool_call_count": 1,
     "cost_estimate_usd": 0.014391,
@@ -211,7 +211,7 @@
       "codex_atlas.agent.Agent._rewrite",
       "codex_atlas.mcp_server.explain",
       "codex_atlas.retriever.Retriever._import_chain",
-      "codex_atlas.cli.eval_cmd",
+      "codex_atlas.eval.harness.evaluate_against_baseline",
       "codex_atlas.retriever.Retriever._hybrid",
       "codex_atlas.retriever.Retriever._neighborhood",
       "codex_atlas.retriever.Retriever._structural",
@@ -221,9 +221,9 @@
       "codex_atlas.cli._open_query_store",
       "codex_atlas.cli.ask",
       "codex_atlas.cli.ask._run",
+      "codex_atlas.cli.eval_cmd",
       "codex_atlas.cli.eval_cmd._run",
-      "codex_atlas.cli.explain",
-      "codex_atlas.cli.explain._run"
+      "codex_atlas.cli.explain"
     ]
   },
   {
@@ -234,7 +234,7 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 2.428207080811262,
+    "latency_ms": 2.692434936761856,
     "attempts": 1,
     "tool_call_count": 1,
     "cost_estimate_usd": 0.011691,
@@ -273,7 +273,7 @@
     "route_correct": true,
     "citation_recall": 1.0,
     "citation_precision": 0.25,
-    "latency_ms": 0.44377194717526436,
+    "latency_ms": 0.5468772724270821,
     "attempts": 1,
     "tool_call_count": 1,
     "cost_estimate_usd": 0.015722999999999997,
@@ -297,10 +297,10 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 0.5233669653534889,
+    "latency_ms": 0.6290948949754238,
     "attempts": 1,
     "tool_call_count": 1,
-    "cost_estimate_usd": 0.052512,
+    "cost_estimate_usd": 0.057357,
     "failure_bucket": "off_topic",
     "cited_qualified_names": [
       "codex_atlas.agent.Agent._retrieve",
@@ -321,7 +321,7 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 0.19525503739714622,
+    "latency_ms": 0.23154402151703835,
     "attempts": 3,
     "tool_call_count": 3,
     "cost_estimate_usd": 0.000522,
@@ -336,7 +336,7 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 0.14870380982756615,
+    "latency_ms": 0.1727091148495674,
     "attempts": 3,
     "tool_call_count": 3,
     "cost_estimate_usd": 0.000525,
@@ -351,20 +351,20 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 3.580089658498764,
+    "latency_ms": 4.311572760343552,
     "attempts": 3,
     "tool_call_count": 3,
-    "cost_estimate_usd": 0.018576000000000002,
+    "cost_estimate_usd": 0.046010999999999996,
     "failure_bucket": "off_topic",
     "cited_qualified_names": [
       "codex_atlas.store.InMemoryChunkStore.setup",
       "codex_atlas.agent.Agent._apply_validation",
       "codex_atlas.store.ChunkStore._require_bootstrapped",
       "codex_atlas.agent.Validator.validate",
+      "codex_atlas.cli.eval_cmd",
       "codex_atlas.embed.Encoder.name",
       "codex_atlas.mcp_server._to_response",
-      "codex_atlas.cli.search._run",
-      "codex_atlas.mcp_server.explain"
+      "codex_atlas.cli.search._run"
     ]
   },
   {
@@ -375,7 +375,7 @@
     "route_correct": true,
     "citation_recall": 0.0,
     "citation_precision": 0.0,
-    "latency_ms": 3.422914072871208,
+    "latency_ms": 4.493156913667917,
     "attempts": 3,
     "tool_call_count": 3,
     "cost_estimate_usd": 0.018788999999999997,
@@ -386,9 +386,9 @@
       "codex_atlas.eval.harness.run_eval",
       "codex_atlas.indexer.ast_parser.parse_python_file",
       "codex_atlas.indexer.graph.CallGraph.add_symbol",
+      "codex_atlas.eval.harness.evaluate_against_baseline",
       "codex_atlas.indexer.ast_parser.resolve_module_name",
-      "codex_atlas.embed.Encoder.name",
-      "codex_atlas.store.InMemoryChunkStore.setup"
+      "codex_atlas.embed.Encoder.name"
     ]
   }
 ]

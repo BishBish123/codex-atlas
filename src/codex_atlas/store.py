@@ -21,6 +21,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -374,6 +375,62 @@ class ChunkStore:
             return 0
 
 
+# ---------------------------------------------------------------------------
+# InMemoryChunkStore load helpers (module-level to stay within complexity
+# thresholds and to be unit-testable independently of the class).
+# ---------------------------------------------------------------------------
+
+_KNOWN_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
+
+
+def _validate_schema_version(sv: int, src: Path) -> None:
+    """Raise ``CorruptedChunkStoreError`` for unknown schema versions."""
+    if sv not in _KNOWN_SCHEMA_VERSIONS:
+        raise CorruptedChunkStoreError(
+            f"snapshot at {src} has unknown schema_version={sv} "
+            f"(known: {sorted(_KNOWN_SCHEMA_VERSIONS)}); "
+            f"rerun `atlas index --store=memory` to rebuild"
+        )
+
+
+def _load_chunk_entry(
+    store: InMemoryChunkStore,
+    i: int,
+    entry: object,
+    dim: int,
+) -> None:
+    """Validate one chunk entry and insert it into ``store`` (without the lock)."""
+    if not isinstance(entry, dict):
+        raise ValueError(f"entry {i} must be a JSON object, got {type(entry).__name__}")
+    cid = str(entry["chunk_id"])
+    store._rows[cid] = StoredChunk(
+        chunk_id=cid,
+        qualified_name=str(entry["qualified_name"]),
+        file_path=str(entry["file_path"]),
+        lineno_start=int(entry["lineno_start"]),
+        lineno_end=int(entry["lineno_end"]),
+        kind=SymbolKind(entry["kind"]),
+        text=str(entry["text"]),
+        score=0.0,  # no cosine — will be set per-query in search()
+    )
+    vec = np.asarray(entry["vector"], dtype=np.float32)
+    # Validate vector shape and finiteness. A NaN or Inf in a stored vector
+    # silently corrupts cosine similarity for every query (dot-product
+    # propagates NaN through the whole ranking). A wrong-dim vector
+    # crashes search().
+    if vec.ndim != 1 or vec.shape[0] != dim:
+        raise ValueError(
+            f"entry {i} (chunk_id={cid!r}): vector has shape "
+            f"{vec.shape!r}, expected ({dim},)"
+        )
+    if not np.all(np.isfinite(vec)):
+        raise ValueError(
+            f"entry {i} (chunk_id={cid!r}): vector contains "
+            f"non-finite values (NaN or Inf)"
+        )
+    store._vectors[cid] = vec
+
+
 class InMemoryChunkStore:
     """Dict-backed chunk store for tests + the eval harness.
 
@@ -497,8 +554,15 @@ class InMemoryChunkStore:
                 self._vectors.pop(cid, None)
             return len(doomed)
 
+    # Threshold above which save_to_path switches from a single-object
+    # JSON file to JSONL (one chunk per line).  At ~10k chunks, a
+    # monolithic JSON object serialises to several hundred MB; JSONL
+    # lets consumers stream individual rows without holding the entire
+    # document in memory.
+    _JSONL_CHUNK_THRESHOLD: int = 10_000
+
     async def save_to_path(self, path: str | Path) -> Path:
-        """Serialise the in-memory state to ``path`` as JSON.
+        """Serialise the in-memory state to ``path``.
 
         Persistence is the missing half of ``--store=memory``: without
         it, ``atlas index --store=memory`` would build the embedding
@@ -506,6 +570,17 @@ class InMemoryChunkStore:
         forcing every ``ask`` / ``search`` to reindex inline. We dump
         rows + vectors + dim to disk so the next CLI invocation can
         ``load_from_path`` and serve queries with no DB.
+
+        **Format selection** — for ≤ 10 000 chunks the file is a
+        single JSON object (backwards-compatible with earlier snapshots);
+        for > 10 000 chunks the file switches to JSONL: a one-line JSON
+        header followed by one chunk-entry per line.  ``load_from_path``
+        detects the format automatically.
+
+        **Disk-space preflight** — before writing, we check that the
+        destination filesystem has at least as many free bytes as the
+        serialised payload.  The check is best-effort; if the stat call
+        fails (network FS, special device) we proceed without it.
 
         Crash- and concurrency-safe: the payload is written to a
         sibling tempfile (``<path>.tmp.<pid>.<ts>``), ``fsync``'d, then
@@ -522,30 +597,50 @@ class InMemoryChunkStore:
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         async with self._lock:
-            payload = {
-                "schema_version": 1,
-                "dim": self._dim,
-                "chunks": [
-                    {
-                        "chunk_id": row.chunk_id,
-                        "qualified_name": row.qualified_name,
-                        "file_path": row.file_path,
-                        "lineno_start": row.lineno_start,
-                        "lineno_end": row.lineno_end,
-                        "kind": str(row.kind),
-                        "text": row.text,
-                        "vector": self._vectors[row.chunk_id].astype(float).tolist(),
-                    }
-                    for row in self._rows.values()
-                ],
-            }
+            n_chunks = len(self._rows)
+            use_jsonl = n_chunks > self._JSONL_CHUNK_THRESHOLD
+            chunk_entries = [
+                {
+                    "chunk_id": row.chunk_id,
+                    "qualified_name": row.qualified_name,
+                    "file_path": row.file_path,
+                    "lineno_start": row.lineno_start,
+                    "lineno_end": row.lineno_end,
+                    "kind": str(row.kind),
+                    "text": row.text,
+                    "vector": self._vectors[row.chunk_id].astype(float).tolist(),
+                }
+                for row in self._rows.values()
+            ]
         # The CLI is the sole caller (one-shot write at end of `atlas
         # index`); blocking I/O here is fine and matches the pattern
         # already used by ``CallGraph.save``.
-        # Build the JSON eagerly so a serialisation error (e.g. NaN in a
+        # Build the payload eagerly so a serialisation error (e.g. NaN in a
         # vector) raises BEFORE we touch the filesystem — leaves the
         # previous snapshot untouched.
-        encoded = json.dumps(payload)
+        header = {"schema_version": 1, "dim": self._dim, "format": "jsonl" if use_jsonl else "json"}
+        if use_jsonl:
+            # JSONL: header line + one chunk entry per line.
+            lines = [json.dumps(header)]
+            lines.extend(json.dumps(e) for e in chunk_entries)
+            encoded = ("\n".join(lines) + "\n").encode("utf-8")
+        else:
+            payload = {**header, "chunks": chunk_entries}
+            encoded = json.dumps(payload).encode("utf-8")
+        # Disk-space preflight: estimate free bytes on the destination
+        # filesystem before writing so we get a clear error rather than
+        # a mysterious partial write or ENOSPC mid-rename.
+        try:
+            usage = shutil.disk_usage(out.parent)
+            if usage.free < len(encoded):
+                raise OSError(
+                    f"not enough disk space: need {len(encoded):,} bytes, "
+                    f"only {usage.free:,} free on {out.parent}"
+                )
+        except OSError as exc:
+            if "not enough disk space" in str(exc):
+                raise
+            # stat failed (network FS, special device, etc.) — proceed.
         # Capture the destination's current permissions so we can restore
         # them after the atomic replace.  ``os.replace`` inherits the
         # tempfile's mode (0o644) rather than the destination's mode, which
@@ -568,7 +663,7 @@ class InMemoryChunkStore:
                 0o644,
             )
             try:
-                os.write(fd, encoded.encode("utf-8"))
+                os.write(fd, encoded)
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -608,66 +703,52 @@ class InMemoryChunkStore:
                 f"in-memory chunk store snapshot not found at {src}; "
                 f"run `atlas index --store=memory` first"
             )
-        # schema_version 1 is the only known version. Snapshots written
-        # before this field was added (schema_version missing) are still
-        # accepted — treat them as version 1. Any future incompatible
-        # format change must bump this constant and add a migration or a
-        # clear error; never silently ignore an unknown version.
-        _KNOWN_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
-
         try:
             raw = src.read_text()  # noqa: ASYNC240
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                raise ValueError(
-                    f"snapshot root must be a JSON object, got {type(payload).__name__}"
-                )
-            # schema_version defaults to 1 for backwards compatibility with
-            # snapshots written before FIX 4 introduced the field.
-            sv = int(payload.get("schema_version", 1))
-            if sv not in _KNOWN_SCHEMA_VERSIONS:
-                raise CorruptedChunkStoreError(
-                    f"snapshot at {src} has unknown schema_version={sv} "
-                    f"(known: {sorted(_KNOWN_SCHEMA_VERSIONS)}); "
-                    f"rerun `atlas index --store=memory` to rebuild"
-                )
-            dim = int(payload["dim"])
-            entries = payload["chunks"]
-            if not isinstance(entries, list):
-                raise ValueError(
-                    f"`chunks` must be a list, got {type(entries).__name__}"
-                )
-            store = cls()
-            await store.setup(dim=dim)
-            async with store._lock:
-                for i, entry in enumerate(entries):
-                    cid = str(entry["chunk_id"])
-                    store._rows[cid] = StoredChunk(
-                        chunk_id=cid,
-                        qualified_name=str(entry["qualified_name"]),
-                        file_path=str(entry["file_path"]),
-                        lineno_start=int(entry["lineno_start"]),
-                        lineno_end=int(entry["lineno_end"]),
-                        kind=SymbolKind(entry["kind"]),
-                        text=str(entry["text"]),
-                        score=0.0,  # no cosine — will be set per-query in search()
+            # Detect format: JSONL files start with a single-line JSON header
+            # that includes "format": "jsonl"; plain JSON is the historic default.
+            first_line = raw.split("\n", 1)[0]
+            is_jsonl = False
+            header_obj: dict[str, object] = {}
+            with contextlib.suppress(json.JSONDecodeError):
+                candidate = json.loads(first_line)
+                if isinstance(candidate, dict) and candidate.get("format") == "jsonl":
+                    is_jsonl = True
+                    header_obj = candidate
+
+            if is_jsonl:
+                sv = int(str(header_obj.get("schema_version", 1)))
+                _validate_schema_version(sv, src)
+                dim = int(str(header_obj["dim"]))
+                store = cls()
+                await store.setup(dim=dim)
+                async with store._lock:
+                    for i, raw_line in enumerate(raw.splitlines()[1:]):
+                        stripped = raw_line.strip()
+                        if not stripped:
+                            continue
+                        _load_chunk_entry(store, i, json.loads(stripped), dim)
+            else:
+                payload = json.loads(raw)
+                if not isinstance(payload, dict):
+                    raise ValueError(
+                        f"snapshot root must be a JSON object, got {type(payload).__name__}"
                     )
-                    vec = np.asarray(entry["vector"], dtype=np.float32)
-                    # Validate vector shape and finiteness. A NaN or Inf in a
-                    # stored vector silently corrupts cosine similarity for
-                    # every query (dot-product propagates NaN through the
-                    # whole ranking). A wrong-dim vector crashes search().
-                    if vec.ndim != 1 or vec.shape[0] != dim:
-                        raise ValueError(
-                            f"entry {i} (chunk_id={cid!r}): vector has shape "
-                            f"{vec.shape!r}, expected ({dim},)"
-                        )
-                    if not np.all(np.isfinite(vec)):
-                        raise ValueError(
-                            f"entry {i} (chunk_id={cid!r}): vector contains "
-                            f"non-finite values (NaN or Inf)"
-                        )
-                    store._vectors[cid] = vec
+                # schema_version defaults to 1 for backwards compatibility with
+                # snapshots written before FIX 4 introduced the field.
+                sv = int(payload.get("schema_version", 1))
+                _validate_schema_version(sv, src)
+                dim = int(payload["dim"])
+                entries = payload["chunks"]
+                if not isinstance(entries, list):
+                    raise ValueError(
+                        f"`chunks` must be a list, got {type(entries).__name__}"
+                    )
+                store = cls()
+                await store.setup(dim=dim)
+                async with store._lock:
+                    for i, entry in enumerate(entries):
+                        _load_chunk_entry(store, i, entry, dim)
         except CorruptedChunkStoreError:
             raise
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:

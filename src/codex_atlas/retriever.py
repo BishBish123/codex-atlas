@@ -204,12 +204,21 @@ def hybrid_score(
 ) -> list[HybridScore]:
     """Combine cosine + graph-distance + tfidf-ish full-text into one score.
 
-    `chunks` carry a cosine score from the vector store. Graph distance
-    is taken from `graph_distances[qname]` (0 if missing — i.e. unknown,
-    treated as "far"). Full-text is a coarse term-overlap fraction
-    against the query — not a real TF-IDF, but cheap and monotonic with
-    relevance. Weights are passed in so the agent / config can tune at
-    runtime; we normalise so callers can pass un-normalised vectors.
+    `chunks` carry a cosine score from the vector store.  A ``score``
+    of exactly ``0.0`` is the sentinel for *no cosine available* (graph-
+    traversal upserts and ``fetch_by_qualified_name`` lookups never run a
+    vector search — see ``StoredChunk`` docstring).  For those rows the
+    cosine weight is redistributed proportionally to the remaining two
+    components so the combined score is still meaningful.  A positive
+    ``score`` is treated as a real cosine similarity.
+
+    Graph distance is taken from `graph_distances[qname]` (99 if
+    missing — i.e. unknown, treated as far away). Full-text is a coarse
+    term-overlap fraction against the query — not a real TF-IDF, but
+    cheap and monotonic with relevance.
+
+    Weights are passed in so the agent / config can tune at runtime; we
+    normalise so callers can pass un-normalised vectors.
     """
     if any(w < 0 for w in weights):
         raise ValueError("weights must be non-negative")
@@ -221,7 +230,10 @@ def hybrid_score(
     q_terms = {t for t in re.split(r"\W+", query.lower()) if len(t) >= 3}
     out: list[HybridScore] = []
     for c in chunks:
-        cosine = max(0.0, min(1.0, c.score))
+        # score==0.0 is the "no cosine" sentinel — treat it as missing
+        # rather than as a genuinely zero similarity.
+        has_cosine = c.score != 0.0
+        cosine = max(0.0, min(1.0, c.score)) if has_cosine else 0.0
         # Seeds get distance 0 by convention; everything else uses the
         # explicit map (with a far-away default).
         gd = 0 if c.qualified_name in seeds else graph_distances.get(c.qualified_name, 99)
@@ -229,7 +241,20 @@ def hybrid_score(
         gd_score = 1.0 / (1.0 + gd)
         text_terms = {t for t in re.split(r"\W+", c.text.lower()) if len(t) >= 3}
         overlap = len(q_terms & text_terms) / len(q_terms) if q_terms else 0.0
-        combined = w_cos * cosine + w_graph * gd_score + w_text * overlap
+        if has_cosine:
+            combined = w_cos * cosine + w_graph * gd_score + w_text * overlap
+        else:
+            # No cosine signal: redistribute cosine weight proportionally
+            # across the two remaining components so the combined score
+            # still lies in [0, 1] and the relative ranking of graph vs
+            # text overlap is preserved.
+            remaining = w_graph + w_text
+            if remaining > 0:
+                w_g2 = w_graph / remaining
+                w_t2 = w_text / remaining
+            else:
+                w_g2, w_t2 = 0.5, 0.5
+            combined = w_g2 * gd_score + w_t2 * overlap
         out.append(
             HybridScore(
                 qualified_name=c.qualified_name,

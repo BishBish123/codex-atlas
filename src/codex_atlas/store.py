@@ -55,7 +55,19 @@ class CorruptedChunkStoreError(RuntimeError):
 
 @dataclass(frozen=True)
 class StoredChunk:
-    """A retrieved chunk with its similarity score."""
+    """A retrieved chunk with its similarity score.
+
+    ``score`` semantics:
+    * **0.0** — no cosine similarity is available (graph-traversal upserts,
+      ``fetch_by_qualified_name`` lookups, or any path that didn't run a
+      vector search).  Downstream scorers (e.g. ``hybrid_score``) treat
+      exactly 0.0 as a missing-cosine signal and omit the cosine component
+      from the combined score rather than treating it as a genuinely
+      terrible match.
+    * **positive** — a real cosine similarity in ``(0, 1]``.  The vector
+      store sets this from the dot-product search; values produced by
+      ``InMemoryChunkStore.search`` are always in this range.
+    """
 
     chunk_id: str
     qualified_name: str
@@ -334,7 +346,7 @@ class ChunkStore:
             lineno_end=row["lineno_end"],
             kind=SymbolKind(row["kind"]),
             text=row["text"],
-            score=1.0,
+            score=0.0,  # no cosine — graph-path lookup, not a vector search
         )
 
     async def delete_by_file_path(self, file_path: str) -> int:
@@ -425,7 +437,7 @@ class InMemoryChunkStore:
                     lineno_end=chunk.lineno_end,
                     kind=chunk.kind,
                     text=chunk.text,
-                    score=1.0,
+                    score=0.0,  # no cosine — will be set per-query in search()
                 )
                 self._vectors[cid] = vectors[i].copy()
             return len(chunks)
@@ -605,7 +617,7 @@ class InMemoryChunkStore:
                         lineno_end=int(entry["lineno_end"]),
                         kind=SymbolKind(entry["kind"]),
                         text=str(entry["text"]),
-                        score=1.0,
+                        score=0.0,  # no cosine — will be set per-query in search()
                     )
                     store._vectors[cid] = np.asarray(entry["vector"], dtype=np.float32)
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:

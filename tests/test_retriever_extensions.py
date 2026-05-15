@@ -315,6 +315,46 @@ class TestSummarizationMaterialisesExpansions:
         assert {"m.b", "m.c"}.issubset(fetched)
 
 
+class TestHybridScoreZeroCosine:
+    """score==0.0 is the no-cosine sentinel; a chunk with a perfect cosine
+    score should outrank a graph-only (score=0.0) chunk even when the
+    graph-only chunk is a direct neighbour of the seed."""
+
+    def test_graph_neighbors_dont_dominate_hybrid_with_perfect_cosine(self) -> None:
+        # graph-only chunk: direct neighbour (gd=1), no cosine.
+        graph_neighbour = _stored("m.neighbor", score=0.0, text="")
+        # vector chunk: not a seed/neighbour, but has a perfect cosine match.
+        vector_hit = _stored("m.best", score=1.0, text="")
+        out = hybrid_score(
+            [graph_neighbour, vector_hit],
+            query="anything",
+            seeds=set(),
+            graph_distances={"m.neighbor": 1, "m.best": 99},
+        )
+        ranked = [s.qualified_name for s in out]
+        # The perfect-cosine chunk must outrank the graph-only neighbour.
+        assert ranked[0] == "m.best", (
+            f"expected m.best first, got {ranked}; "
+            f"scores: {[(s.qualified_name, s.combined) for s in out]}"
+        )
+
+    def test_zero_score_treated_as_missing_not_zero_cosine(self) -> None:
+        """Two chunks with score=0.0 — combined is derived from graph/text only."""
+        a = _stored("m.a", score=0.0, text="hello world query")
+        b = _stored("m.b", score=0.0, text="unrelated stuff here")
+        out = hybrid_score(
+            [a, b],
+            query="hello query",
+            seeds=set(),
+            graph_distances={},
+        )
+        # a has more text overlap → should rank higher than b.
+        assert out[0].qualified_name == "m.a"
+        # cosine field is 0.0 for both since score was 0.0.
+        assert out[0].cosine == 0.0
+        assert out[1].cosine == 0.0
+
+
 class TestRouteOverride:
     """Explicit ``route_override`` skips the classifier and runs the named route."""
 

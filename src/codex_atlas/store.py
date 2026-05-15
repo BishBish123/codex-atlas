@@ -523,6 +523,7 @@ class InMemoryChunkStore:
         out.parent.mkdir(parents=True, exist_ok=True)
         async with self._lock:
             payload = {
+                "schema_version": 1,
                 "dim": self._dim,
                 "chunks": [
                     {
@@ -607,12 +608,28 @@ class InMemoryChunkStore:
                 f"in-memory chunk store snapshot not found at {src}; "
                 f"run `atlas index --store=memory` first"
             )
+        # schema_version 1 is the only known version. Snapshots written
+        # before this field was added (schema_version missing) are still
+        # accepted — treat them as version 1. Any future incompatible
+        # format change must bump this constant and add a migration or a
+        # clear error; never silently ignore an unknown version.
+        _KNOWN_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
+
         try:
             raw = src.read_text()  # noqa: ASYNC240
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 raise ValueError(
                     f"snapshot root must be a JSON object, got {type(payload).__name__}"
+                )
+            # schema_version defaults to 1 for backwards compatibility with
+            # snapshots written before FIX 4 introduced the field.
+            sv = int(payload.get("schema_version", 1))
+            if sv not in _KNOWN_SCHEMA_VERSIONS:
+                raise CorruptedChunkStoreError(
+                    f"snapshot at {src} has unknown schema_version={sv} "
+                    f"(known: {sorted(_KNOWN_SCHEMA_VERSIONS)}); "
+                    f"rerun `atlas index --store=memory` to rebuild"
                 )
             dim = int(payload["dim"])
             entries = payload["chunks"]
@@ -623,7 +640,7 @@ class InMemoryChunkStore:
             store = cls()
             await store.setup(dim=dim)
             async with store._lock:
-                for entry in entries:
+                for i, entry in enumerate(entries):
                     cid = str(entry["chunk_id"])
                     store._rows[cid] = StoredChunk(
                         chunk_id=cid,
@@ -635,7 +652,24 @@ class InMemoryChunkStore:
                         text=str(entry["text"]),
                         score=0.0,  # no cosine — will be set per-query in search()
                     )
-                    store._vectors[cid] = np.asarray(entry["vector"], dtype=np.float32)
+                    vec = np.asarray(entry["vector"], dtype=np.float32)
+                    # Validate vector shape and finiteness. A NaN or Inf in a
+                    # stored vector silently corrupts cosine similarity for
+                    # every query (dot-product propagates NaN through the
+                    # whole ranking). A wrong-dim vector crashes search().
+                    if vec.ndim != 1 or vec.shape[0] != dim:
+                        raise ValueError(
+                            f"entry {i} (chunk_id={cid!r}): vector has shape "
+                            f"{vec.shape!r}, expected ({dim},)"
+                        )
+                    if not np.all(np.isfinite(vec)):
+                        raise ValueError(
+                            f"entry {i} (chunk_id={cid!r}): vector contains "
+                            f"non-finite values (NaN or Inf)"
+                        )
+                    store._vectors[cid] = vec
+        except CorruptedChunkStoreError:
+            raise
         except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
             raise CorruptedChunkStoreError(
                 f"snapshot at {src} is corrupt or malformed ({exc}); "

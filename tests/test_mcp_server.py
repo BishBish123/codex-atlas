@@ -16,11 +16,12 @@ from typing import Any
 import pytest
 
 from codex_atlas import mcp_server
-from codex_atlas.agent import AgentResult, CancelReason, Citation
+from codex_atlas.agent import AgentResult, CancelReason, Citation, TraceEvent
 from codex_atlas.indexer.ast_parser import ParsedFile, Symbol, SymbolKind
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.mcp_server import (
     MAX_NEIGHBORHOOD_DEPTH,
+    AgentTimeoutResponse,
     CallersResponse,
     CodebaseStats,
     NeighborhoodResponse,
@@ -285,9 +286,8 @@ class TestCancelledSurface:
     async def test_cancelled_run_surfaces_in_mcp_response(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # When the agent reports a cancelled run, the MCP response must
-        # carry the cancel reason as a string so clients can distinguish
-        # "no results" from "the run was killed by the deadline".
+        # When the agent reports a cancelled run due to TIMEOUT, the MCP
+        # response must be an AgentTimeoutResponse with error="agent_timeout".
 
         async def fake_agent(top_k: int = 8) -> _StubAgent:
             agent = _StubAgent()
@@ -301,7 +301,7 @@ class TestCancelledSurface:
                     route=Route.LOOKUP,
                     grade=0.0,
                     attempts=1,
-                    trace=[],
+                    trace=[TraceEvent(node="retrieve", started_at=0.0, elapsed_ms=10.0)],
                     cancelled=CancelReason.TIMEOUT,
                 )
 
@@ -310,8 +310,9 @@ class TestCancelledSurface:
 
         monkeypatch.setattr(mcp_server, "_agent", fake_agent)
         resp = await search_code("anything")
-        assert resp.cancelled == "timeout"
-        assert resp.answer == ""
+        assert isinstance(resp, AgentTimeoutResponse)
+        assert resp.error == "agent_timeout"
+        assert resp.phase == "retrieve"
 
     async def test_completed_run_has_null_cancelled(
         self, stub_agent_factory: dict[str, object]
@@ -319,6 +320,77 @@ class TestCancelledSurface:
         # Sanity check: a normal run leaves ``cancelled`` as None.
         resp = await search_code("anything")
         assert resp.cancelled is None
+
+
+class TestMcpAgentTimeoutTypedError:
+    """test_mcp_agent_timeout_returns_typed_error
+
+    When the agent's run_timeout_s or step_timeout_s fires, the MCP tool
+    must return an ``AgentTimeoutResponse`` with ``error="agent_timeout"``
+    and a ``phase`` string identifying the last executing node.  This is a
+    typed error signal — not a raised exception — so MCP clients can key
+    on the ``error`` field without parsing exception messages.
+    """
+
+    async def test_mcp_agent_timeout_returns_typed_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A timed-out agent run produces AgentTimeoutResponse, not SearchResponse."""
+        async def fake_agent(top_k: int = 8) -> _StubAgent:
+            agent = _StubAgent()
+
+            async def _run(query: str, *, route_override: Route | None = None) -> AgentResult:
+                # Simulate a run that was cancelled mid-retrieve.
+                return AgentResult(
+                    query=query,
+                    final_query=query,
+                    answer="",
+                    citations=[],
+                    route=Route.LOOKUP,
+                    grade=0.0,
+                    attempts=1,
+                    trace=[
+                        TraceEvent(node="classify", started_at=0.0, elapsed_ms=1.0),
+                        TraceEvent(node="retrieve", started_at=1.0, elapsed_ms=8999.0),
+                    ],
+                    cancelled=CancelReason.TIMEOUT,
+                )
+
+            agent.run = _run  # type: ignore[method-assign]
+            return agent
+
+        monkeypatch.setattr(mcp_server, "_agent", fake_agent)
+        resp = await search_code("find all auth routes")
+        assert isinstance(resp, AgentTimeoutResponse), (
+            f"expected AgentTimeoutResponse, got {type(resp).__name__}: {resp!r}"
+        )
+        assert resp.error == "agent_timeout"
+        # Phase should reflect the last trace node (retrieve in this case).
+        assert resp.phase == "retrieve"
+
+    async def test_timeout_env_overrides_are_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ATLAS_STEP_TIMEOUT_S and ATLAS_RUN_TIMEOUT_S are forwarded to AgentConfig."""
+        import codex_atlas.mcp_server as srv  # noqa: PLC0415
+
+        monkeypatch.setenv("ATLAS_STEP_TIMEOUT_S", "5")
+        monkeypatch.setenv("ATLAS_RUN_TIMEOUT_S", "20")
+        cfg = srv._agent_config()
+        assert cfg.step_timeout_s == 5.0
+        assert cfg.run_timeout_s == 20.0
+
+    async def test_zero_timeout_env_disables_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Setting ATLAS_STEP_TIMEOUT_S=0 disables the step timeout."""
+        import codex_atlas.mcp_server as srv  # noqa: PLC0415
+
+        monkeypatch.setenv("ATLAS_STEP_TIMEOUT_S", "0")
+        monkeypatch.setenv("ATLAS_RUN_TIMEOUT_S", "0")
+        cfg = srv._agent_config()
+        assert cfg.step_timeout_s is None
+        assert cfg.run_timeout_s is None
 
 
 class TestModelShapes:

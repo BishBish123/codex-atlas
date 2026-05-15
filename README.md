@@ -102,6 +102,11 @@ uv run atlas ask "who calls find_callers" --store=postgres
 
 ## Run as an MCP server
 
+The MCP server defaults to `ATLAS_STORE=memory` (reads `data/chunks.json`), so no
+Postgres container is needed.  Agent timeouts default to `ATLAS_STEP_TIMEOUT_S=10` (per
+retrieval/synthesis step) and `ATLAS_RUN_TIMEOUT_S=30` (whole run); set either to `0` to
+disable.  On timeout, tools return `{"error": "agent_timeout", "phase": "<last_node>"}`.
+
 ```bash
 # stdio for Claude Desktop / Claude Code
 POSTGRES_DSN=$POSTGRES_DSN ATLAS_GRAPH_PATH=data/graph.json \

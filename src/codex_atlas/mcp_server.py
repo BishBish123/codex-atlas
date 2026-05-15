@@ -29,7 +29,7 @@ import typer
 from fastmcp import FastMCP
 from pydantic import BaseModel
 
-from codex_atlas.agent import Agent, AgentResult
+from codex_atlas.agent import Agent, AgentConfig, AgentResult, CancelReason
 from codex_atlas.embed import Encoder, FakeEncoder
 from codex_atlas.indexer.graph import CallGraph
 from codex_atlas.retriever import Retriever, RetrieverConfig, Route
@@ -76,6 +76,20 @@ class SearchResponse(BaseModel):
     # clients distinguish a cancelled run (empty answer + cancelled set)
     # from a normal "no results" answer (empty answer + cancelled None).
     cancelled: str | None = None
+
+
+class AgentTimeoutResponse(BaseModel):
+    """Returned by any MCP tool when the agent run is cancelled due to a timeout.
+
+    ``error`` is always ``"agent_timeout"``.
+    ``phase`` is the last node that was executing when the deadline fired
+    (e.g. ``"retrieve"``, ``"grade"``, ``"answer"``).  Downstream clients
+    can key on ``error == "agent_timeout"`` to distinguish a timeout from
+    any other failure without parsing the message string.
+    """
+
+    error: str = "agent_timeout"
+    phase: str
 
 
 class CallerEntry(BaseModel):
@@ -157,6 +171,30 @@ def _chunks_path() -> Path:
     return Path(os.environ.get("ATLAS_CHUNKS_PATH", "data/chunks.json"))
 
 
+# Default timeout constants — overridable via environment variables
+# ATLAS_STEP_TIMEOUT_S and ATLAS_RUN_TIMEOUT_S.
+_DEFAULT_STEP_TIMEOUT_S: float = 10.0
+_DEFAULT_RUN_TIMEOUT_S: float = 30.0
+
+
+def _agent_config() -> AgentConfig:
+    """Build an ``AgentConfig`` with defaults + optional env overrides.
+
+    ``ATLAS_STEP_TIMEOUT_S`` overrides the per-step (retriever /
+    synthesiser) timeout; ``ATLAS_RUN_TIMEOUT_S`` overrides the
+    whole-run timeout.  Both default to 10 s / 30 s respectively so
+    a hung retrieval or synthesiser doesn't stall the MCP client
+    indefinitely.  Set either variable to ``0`` to disable that
+    timeout (not recommended in production).
+    """
+    step_s = float(os.environ.get("ATLAS_STEP_TIMEOUT_S", _DEFAULT_STEP_TIMEOUT_S))
+    run_s = float(os.environ.get("ATLAS_RUN_TIMEOUT_S", _DEFAULT_RUN_TIMEOUT_S))
+    return AgentConfig(
+        step_timeout_s=step_s if step_s > 0 else None,
+        run_timeout_s=run_s if run_s > 0 else None,
+    )
+
+
 async def _agent(top_k: int = 8) -> Agent:
     """Build an agent for one request, reusing a process-wide store + graph.
 
@@ -166,6 +204,10 @@ async def _agent(top_k: int = 8) -> Agent:
     pgvector connection pool, the encoder, the call graph — are cached
     on first use so subsequent requests don't re-run DDL or re-load
     the graph from disk.
+
+    Per-step and whole-run timeouts default to
+    ``ATLAS_STEP_TIMEOUT_S`` (10 s) and ``ATLAS_RUN_TIMEOUT_S`` (30 s)
+    respectively; set either env var to ``0`` to disable.
     """
     from codex_atlas.store import ChunkStore, InMemoryChunkStore  # noqa: PLC0415
 
@@ -182,7 +224,7 @@ async def _agent(top_k: int = 8) -> Agent:
             _cached_graph,
             RetrieverConfig(top_k=top_k),
         )
-        return Agent(retriever)
+        return Agent(retriever, config=_agent_config())
     # Cold path: serialise so concurrent first-callers don't each
     # create a duplicate ChunkStore / pool / graph.
     async with _init_lock:
@@ -204,10 +246,22 @@ async def _agent(top_k: int = 8) -> Agent:
         _cached_graph,
         RetrieverConfig(top_k=top_k),
     )
-    return Agent(retriever)
+    return Agent(retriever, config=_agent_config())
 
 
-def _to_response(result: AgentResult) -> SearchResponse:
+def _to_response(result: AgentResult) -> SearchResponse | AgentTimeoutResponse:
+    """Convert an ``AgentResult`` to the appropriate MCP response.
+
+    Returns an ``AgentTimeoutResponse`` (``{"error": "agent_timeout",
+    "phase": "<last_node>"}`` ) when the run was cancelled due to a
+    timeout.  The phase is taken from the last trace event so callers
+    can identify which step hit the deadline.  All other runs return the
+    normal ``SearchResponse``.
+    """
+    if result.cancelled is CancelReason.TIMEOUT:
+        # Identify the last node that was executing when the deadline fired.
+        phase = result.trace[-1].node if result.trace else "unknown"
+        return AgentTimeoutResponse(error="agent_timeout", phase=str(phase))
     # Surface the per-chunk score + text the agent threaded through the
     # ``Citation`` record. Earlier the MCP layer hardcoded score=0.0 and
     # text="" — the schema advertised score: float and text: str but
@@ -235,7 +289,7 @@ def _to_response(result: AgentResult) -> SearchResponse:
 
 
 @mcp.tool
-async def search_code(query: str, top_k: int = 8) -> SearchResponse:
+async def search_code(query: str, top_k: int = 8) -> SearchResponse | AgentTimeoutResponse:
     """Adaptive-route code search. Returns synthesised answer + citations."""
     if not query.strip():
         raise ValueError("query must not be blank")
@@ -248,7 +302,7 @@ async def search_code(query: str, top_k: int = 8) -> SearchResponse:
 
 
 @mcp.tool
-async def explain_function(qualified_name: str) -> SearchResponse:
+async def explain_function(qualified_name: str) -> SearchResponse | AgentTimeoutResponse:
     """Pull the chunk for `qualified_name` plus its immediate neighbours."""
     if not qualified_name.strip():
         raise ValueError("qualified_name must not be blank")
@@ -289,7 +343,7 @@ async def find_callers(qualified_name: str, depth: int = 1) -> CallersResponse:
 
 
 @mcp.tool
-async def summarize_module(module_path: str) -> SearchResponse:
+async def summarize_module(module_path: str) -> SearchResponse | AgentTimeoutResponse:
     """High-level walkthrough of a module via the summarization route."""
     if not module_path.strip():
         raise ValueError("module_path must not be blank")
@@ -298,7 +352,7 @@ async def summarize_module(module_path: str) -> SearchResponse:
 
 
 @mcp.tool
-async def search_codebase(query: str, top_k: int = 8, route: str | None = None) -> SearchResponse:
+async def search_codebase(query: str, top_k: int = 8, route: str | None = None) -> SearchResponse | AgentTimeoutResponse:
     """Generic search with an optional explicit route override.
 
     Pass ``route="structural"`` (or any ``Route`` value) to skip the
@@ -359,7 +413,7 @@ async def get_graph_neighborhood(symbol: str, depth: int = 2) -> NeighborhoodRes
 
 
 @mcp.tool
-async def explain(symbol: str) -> SearchResponse:
+async def explain(symbol: str) -> SearchResponse | AgentTimeoutResponse:
     """End-to-end agent run anchored on a symbol — the everything tool."""
     if not symbol.strip():
         raise ValueError("symbol must not be blank")

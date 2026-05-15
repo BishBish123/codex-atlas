@@ -545,6 +545,16 @@ class InMemoryChunkStore:
         # vector) raises BEFORE we touch the filesystem — leaves the
         # previous snapshot untouched.
         encoded = json.dumps(payload)
+        # Capture the destination's current permissions so we can restore
+        # them after the atomic replace.  ``os.replace`` inherits the
+        # tempfile's mode (0o644) rather than the destination's mode, which
+        # would silently downgrade a 0o600 snapshot to world-readable.
+        # Read the mode BEFORE the write so a concurrent chmod between
+        # stat and replace still wins — the worst case is we restore the
+        # pre-write mode, which is no worse than the old behaviour.
+        dest_mode: int | None = None
+        with contextlib.suppress(OSError):
+            dest_mode = os.stat(out).st_mode & 0o777
         # Sibling tempfile keeps the rename on the same filesystem so
         # ``os.replace`` is guaranteed atomic. PID + monotonic ns
         # disambiguates concurrent writers in the same process AND
@@ -562,6 +572,12 @@ class InMemoryChunkStore:
             finally:
                 os.close(fd)
             os.replace(tmp_path, out)
+            # Restore the pre-existing permissions after the atomic swap.
+            # Best-effort: a chmod failure is not fatal — the snapshot is
+            # already written and readable.
+            if dest_mode is not None:
+                with contextlib.suppress(OSError):
+                    os.chmod(out, dest_mode)
         except BaseException:
             # Best-effort cleanup so a failed write doesn't leak the
             # tempfile next to the snapshot. ``missing_ok`` swallows the

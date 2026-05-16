@@ -15,8 +15,13 @@ The persistence format is a single `.json` for portability + diffability
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
+import socket
+import time
+import uuid
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -25,6 +30,17 @@ import networkx as nx
 from codex_atlas.indexer.ast_parser import ImportRef, ParsedFile, Symbol, SymbolKind
 
 _log = logging.getLogger(__name__)
+
+
+class CorruptedGraphError(RuntimeError):
+    """Raised when ``CallGraph.load`` finds a malformed graph snapshot.
+
+    The on-disk JSON is present but its bytes are unparseable, missing
+    required keys, or contain values of the wrong shape. The error
+    message instructs the caller to rebuild via ``atlas index`` rather
+    than attempting partial recovery — a partial graph silently breaks
+    call-chain and import-chain queries.
+    """
 
 EDGE_CALLS = "calls"
 EDGE_IMPORTS = "imports"
@@ -269,6 +285,16 @@ class CallGraph:
     # ---------- persistence ----------
 
     def save(self, path: str | Path) -> Path:
+        """Atomically write the graph to ``path`` as JSON.
+
+        Uses the same sibling-tempfile + ``os.replace`` pattern as
+        ``InMemoryChunkStore.save_to_path``: the destination either
+        holds the previous complete snapshot or the new complete
+        snapshot — never a partially-written file.  The tempfile name
+        includes the hostname, PID, monotonic timestamp, and a uuid4
+        fragment so concurrent writers on the same or different hosts
+        (shared NFS) can't collide.
+        """
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -278,18 +304,68 @@ class CallGraph:
                 for u, v, d in self._g.edges(data=True)
             ],
         }
-        out.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        # Capture destination permissions before the write (same rationale
+        # as InMemoryChunkStore.save_to_path — see that docstring).
+        dest_mode: int | None = None
+        with contextlib.suppress(OSError):
+            dest_mode = os.stat(out).st_mode & 0o777
+        # Hostname + PID + monotonic_ns + uuid4 disambiguates writers
+        # across hosts (NFS) and within the same process.
+        hostname = socket.gethostname().replace("/", "_")
+        uid = uuid.uuid4().hex[:8]
+        tmp_path = out.with_name(
+            f"{out.name}.tmp.{hostname}.{os.getpid()}.{time.monotonic_ns()}.{uid}"
+        )
+        try:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            try:
+                os.write(fd, encoded)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp_path, out)
+            if dest_mode is not None:
+                with contextlib.suppress(OSError):
+                    os.chmod(out, dest_mode)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+            raise
         return out
 
     @classmethod
     def load(cls, path: str | Path) -> CallGraph:
-        payload = json.loads(Path(path).read_text())
-        g = cls()
-        for n in payload["nodes"]:
-            attrs = {k: v for k, v in n.items() if k != "id"}
-            g._g.add_node(n["id"], **attrs)
-        for e in payload["edges"]:
-            g._g.add_edge(e["src"], e["dst"], kind=e.get("kind", ""))
+        """Load a ``CallGraph`` from a JSON snapshot written by ``save``.
+
+        Raises ``FileNotFoundError`` when the snapshot is missing.
+        Raises ``CorruptedGraphError`` when the file is present but
+        unparseable, missing required keys, or structurally invalid.
+        """
+        src = Path(path)
+        try:
+            payload = json.loads(src.read_text())
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"snapshot root must be a JSON object, got {type(payload).__name__}"
+                )
+            nodes = payload["nodes"]
+            edges = payload["edges"]
+            if not isinstance(nodes, list):
+                raise ValueError(f"`nodes` must be a list, got {type(nodes).__name__}")
+            if not isinstance(edges, list):
+                raise ValueError(f"`edges` must be a list, got {type(edges).__name__}")
+            g = cls()
+            for n in nodes:
+                attrs = {k: v for k, v in n.items() if k != "id"}
+                g._g.add_node(n["id"], **attrs)
+            for e in edges:
+                g._g.add_edge(e["src"], e["dst"], kind=e.get("kind", ""))
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+            raise CorruptedGraphError(
+                f"call-graph snapshot at {src} is corrupt or malformed ({exc}); "
+                f"rerun `atlas index` to rebuild"
+            ) from exc
         return g
 
 

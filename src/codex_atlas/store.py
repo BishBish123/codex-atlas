@@ -22,7 +22,9 @@ import json
 import os
 import re
 import shutil
+import socket
 import time
+import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -652,14 +654,21 @@ class InMemoryChunkStore:
         with contextlib.suppress(OSError):
             dest_mode = os.stat(out).st_mode & 0o777
         # Sibling tempfile keeps the rename on the same filesystem so
-        # ``os.replace`` is guaranteed atomic. PID + monotonic ns
-        # disambiguates concurrent writers in the same process AND
-        # across processes.
-        tmp_path = out.with_name(f"{out.name}.tmp.{os.getpid()}.{time.monotonic_ns()}")
+        # ``os.replace`` is guaranteed atomic. Hostname + PID + monotonic
+        # ns + uuid4 fragment together disambiguate concurrent writers
+        # across hosts (shared NFS) AND within the same process.
+        # O_EXCL ensures we fail loudly if somehow a stale tempfile with
+        # the same name already exists (astronomically unlikely with uuid4,
+        # but correct-by-construction rather than correct-by-probability).
+        hostname = socket.gethostname().replace("/", "_")
+        uid = uuid.uuid4().hex[:8]
+        tmp_path = out.with_name(
+            f"{out.name}.tmp.{hostname}.{os.getpid()}.{time.monotonic_ns()}.{uid}"
+        )
         try:
             fd = os.open(
                 tmp_path,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                 0o644,
             )
             try:

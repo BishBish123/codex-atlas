@@ -31,6 +31,7 @@ state machine.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import os
 import re
@@ -69,6 +70,20 @@ _REJECT_MESSAGE = (
     "I could not produce a grounded answer for that query. "
     "Validation flagged ungrounded claims that aren't backed by the retrieved code."
 )
+
+
+class InvalidValidationReport(ValueError):
+    """Raised by ``Agent._apply_validation`` when a ``ValidationReport``
+    contains spans that violate the documented contract:
+
+    * Each span must satisfy ``0 <= start < end <= len(answer)``.
+    * Spans must not overlap after sorting by ``start``.
+
+    A validator that returns an inconsistent report would cause the
+    redactor to silently corrupt the answer text (out-of-bounds slice,
+    or double-application of a replacement). Raising early gives
+    the caller a clear signal instead.
+    """
 
 
 class CancelReason(StrEnum):
@@ -755,6 +770,33 @@ class Agent:
         )
         return report
 
+    @staticmethod
+    def _validate_spans(spans: list[ClaimSpan], answer: str) -> None:
+        """Raise ``InvalidValidationReport`` for out-of-bounds or overlapping spans.
+
+        Checks are performed on the full ``spans`` list (grounded and
+        ungrounded alike) because the redactor later filters to ungrounded
+        spans — an out-of-bounds grounded span would produce a corrupt
+        answer if we only validated ungrounded ones.
+        """
+        n = len(answer)
+        for s in spans:
+            if not (0 <= s.start < s.end <= n):
+                raise InvalidValidationReport(
+                    f"span for claim {s.claim!r} has bounds ({s.start}, {s.end}) "
+                    f"outside answer of length {n}; "
+                    f"validator produced a corrupt ValidationReport"
+                )
+        # Check for overlaps after sorting by start.
+        sorted_spans = sorted(spans, key=lambda sp: sp.start)
+        for a, b in itertools.pairwise(sorted_spans):
+            if b.start < a.end:
+                raise InvalidValidationReport(
+                    f"spans for {a.claim!r} ({a.start}:{a.end}) and "
+                    f"{b.claim!r} ({b.start}:{b.end}) overlap; "
+                    f"validator produced a corrupt ValidationReport"
+                )
+
     def _apply_validation(
         self, state: _State, answer: str, report: ValidationReport
     ) -> str:
@@ -763,7 +805,14 @@ class Agent:
         Returns the (possibly modified) answer. ``advisory`` and accepted
         answers pass through unchanged; ``redact`` rewrites flagged
         claims; ``reject`` replaces the entire answer.
+
+        Raises ``InvalidValidationReport`` when ``report.spans`` violates
+        the contract (``0 <= start < end <= len(answer)``, no overlaps).
+        The check runs before any answer mutation so a bad report never
+        corrupts the answer silently.
         """
+        if report.spans:
+            self._validate_spans(report.spans, answer)
         if report.is_acceptable:
             return answer
         mode = self._config.validation_mode

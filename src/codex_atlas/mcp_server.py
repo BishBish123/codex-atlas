@@ -42,6 +42,14 @@ from codex_atlas.retriever import Retriever, RetrieverConfig, Route
 # "everything related to this symbol" question on the indexed corpus.
 MAX_NEIGHBORHOOD_DEPTH = 8
 
+# Hard caps applied in ``_to_response`` so a single runaway answer or a
+# very wide retrieval can never flood an MCP client's context window.
+# 200 000 bytes ≈ 150k tokens at 1.3 bytes/token — generous but bounded.
+MAX_MCP_ANSWER_BYTES: int = 200_000
+# Cap the citations list so response serialisation stays O(1) in size
+# for the common "explain a large module" queries that pull 50+ chunks.
+MAX_MCP_CITATIONS: int = 20
+
 _log = logging.getLogger(__name__)
 
 mcp: FastMCP = FastMCP(
@@ -267,6 +275,18 @@ def _to_response(result: AgentResult) -> SearchResponse | AgentTimeoutResponse:
     # text="" — the schema advertised score: float and text: str but
     # every response flatlined those fields, which made score-aware
     # downstream code (re-ranking, snippet rendering) impossible.
+    #
+    # Apply hard caps so a runaway answer or very wide retrieval cannot
+    # flood the MCP client's context window.
+    answer = result.answer
+    if len(answer.encode("utf-8")) > MAX_MCP_ANSWER_BYTES:
+        # Truncate to the last valid UTF-8 boundary within the byte cap
+        # and append a truncation marker.
+        truncated = answer.encode("utf-8")[:MAX_MCP_ANSWER_BYTES].decode(
+            "utf-8", errors="ignore"
+        )
+        answer = truncated + "\n\n[answer truncated at MAX_MCP_ANSWER_BYTES]"
+    citations = result.citations[:MAX_MCP_CITATIONS]
     hits = [
         CodeSearchHit(
             qualified_name=c.qualified_name,
@@ -276,13 +296,13 @@ def _to_response(result: AgentResult) -> SearchResponse | AgentTimeoutResponse:
             score=c.score,
             text=c.text,
         )
-        for c in result.citations
+        for c in citations
     ]
     return SearchResponse(
         route=str(result.route),
         grade=result.grade,
         attempts=result.attempts,
-        answer=result.answer,
+        answer=answer,
         citations=hits,
         cancelled=str(result.cancelled) if result.cancelled is not None else None,
     )

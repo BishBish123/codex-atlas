@@ -161,7 +161,7 @@ The eval report includes a hand-written **7-failure-mode taxonomy** with mitigat
 | Embedder | sentence-transformers (`bge-small`) | Free, fast, top-tier on MTEB; gated extra for Intel macOS |
 | Agent loop | Hand-rolled async state machine | LangGraph-style nodes without the dep; trace surface is identical |
 | CLI | Typer + Rich | Standard for new Python in 2026 |
-| Tests | pytest + pytest-asyncio | 244 tests, mocked DB / API |
+| Tests | pytest + pytest-asyncio | mocked DB / API |
 
 ## Layout
 
@@ -170,13 +170,13 @@ src/codex_atlas/
   indexer/        AST parser + walker + CallGraph (NetworkX)
   embed.py        Encoder protocol + FakeEncoder (no torch)
   store.py        Async pgvector adapter (asyncpg + pgvector-py)
-  retriever.py    Heuristic classifier + 4-route retriever
+  retriever.py    Heuristic classifier + 6-route retriever
   agent.py        State machine: classify → retrieve → grade → rewrite → answer
   mcp_server.py   FastMCP wrapping 7 tools + 1 resource
   cli.py          `atlas index | ask | eval`
   eval/           Golden set + harness + render_report
 
-tests/            163 unit tests (no DB) + integration markers
+tests/            unit tests (no DB) + integration markers
 evals/REPORT.md       Eval report (regenerated on every CI run)
 evals/INTERPRETATION.md  How to read the eval metrics + 7-bucket failure taxonomy
 docs/ARCHITECTURE.md  Deep dive into indexer / graph / retriever / agent

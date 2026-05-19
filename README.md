@@ -108,13 +108,17 @@ retrieval/synthesis step) and `ATLAS_RUN_TIMEOUT_S=30` (whole run); set either t
 disable.  On timeout, tools return `{"error": "agent_timeout", "phase": "<last_node>"}`.
 
 ```bash
-# stdio for Claude Desktop / Claude Code
-POSTGRES_DSN=$POSTGRES_DSN ATLAS_GRAPH_PATH=data/graph.json \
-    uv run atlas-mcp run
+# stdio for Claude Desktop / Claude Code (memory store, no DSN needed)
+ATLAS_STORE=memory ATLAS_GRAPH_PATH=data/graph.json \
+    uv run atlas-mcp
 
 # HTTP for the MCP Inspector / remote clients
-POSTGRES_DSN=$POSTGRES_DSN ATLAS_GRAPH_PATH=data/graph.json \
-    uv run atlas-mcp run --transport http --port 8090
+ATLAS_STORE=memory ATLAS_GRAPH_PATH=data/graph.json \
+    uv run atlas-mcp --transport http --port 8090
+
+# Postgres backend (only when ATLAS_STORE=postgres)
+POSTGRES_DSN=$POSTGRES_DSN ATLAS_STORE=postgres ATLAS_GRAPH_PATH=data/graph.json \
+    uv run atlas-mcp
 ```
 
 Then in your MCP client config:
@@ -124,13 +128,23 @@ Then in your MCP client config:
   "mcpServers": {
     "codex-atlas": {
       "command": "uv",
-      "args": ["run", "atlas-mcp", "run"],
+      "args": ["run", "atlas-mcp"],
       "env": {
-        "POSTGRES_DSN": "postgresql://bench:bench@localhost:5433/bench",
+        "ATLAS_STORE": "memory",
         "ATLAS_GRAPH_PATH": "data/graph.json"
       }
     }
   }
+}
+```
+
+For the Postgres backend, swap the env block:
+
+```json
+"env": {
+  "ATLAS_STORE": "postgres",
+  "POSTGRES_DSN": "postgresql://bench:bench@localhost:5433/bench",
+  "ATLAS_GRAPH_PATH": "data/graph.json"
 }
 ```
 

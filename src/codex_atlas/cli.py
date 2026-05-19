@@ -188,12 +188,36 @@ def index(
     ),
 ) -> None:
     """Walk `corpus`, parse every .py, embed every chunk, persist the graph."""
+    # Reject non-directory corpus paths up front: passing a single .py
+    # file (or a missing path) used to silently produce a 0-file walk
+    # which then *overwrote* `data/graph.json` with an empty graph,
+    # bricking every structural query route. Validate before any state
+    # write so the user gets a typer-shaped error and the previous graph
+    # stays intact.
+    if not corpus.is_dir():
+        what = "missing path" if not corpus.exists() else "file"
+        raise typer.BadParameter(
+            f"CORPUS must be a directory; got {what}: {corpus}. "
+            "To index a single file, pass a directory containing only that file.",
+            param_hint="CORPUS",
+        )
 
     async def _run() -> None:  # noqa: PLR0912
         encoder_obj = _resolve_encoder(encoder)
         if output_format == "rich":
             console.print(f"[green]parsing[/] {corpus}")
         parsed = parse_corpus(corpus, max_files=max_files)
+        if not parsed:
+            # Defensive second line: even with a directory corpus the
+            # walker can return zero files (pure non-Python tree, all
+            # files filtered, etc.). We refuse to overwrite graph.json
+            # with an empty graph in that case — the user almost
+            # certainly intended a different path.
+            raise typer.BadParameter(
+                f"0 .py files found under {corpus}; aborting to avoid wiping "
+                f"{graph_out} with an empty graph.",
+                param_hint="CORPUS",
+            )
         if output_format == "rich":
             console.print(f"[green]parsed[/] {len(parsed)} files")
 

@@ -54,6 +54,67 @@ class TestHelp:
         assert "failure-report" in result.stdout.lower()
 
 
+class TestIndexCorpusValidation:
+    """`atlas index <file.py>` (single file) used to silently produce a
+    0-file walk and overwrite ``data/graph.json`` with an empty graph,
+    bricking every structural query route. The CLI now rejects any
+    non-directory corpus argument before it touches state."""
+
+    def test_index_rejects_file_path(self, tmp_path: Path) -> None:
+        single_file = tmp_path / "loose.py"
+        single_file.write_text("def x(): pass\n")
+        graph_out = tmp_path / "graph.json"
+        # Pre-write a graph that the test will assert is preserved.
+        graph_out.write_text('{"sentinel": "do not overwrite"}')
+        result = runner.invoke(
+            app,
+            [
+                "index",
+                str(single_file),
+                "--graph-out",
+                str(graph_out),
+                "--skip-embed",
+            ],
+        )
+        assert result.exit_code != 0, result.stdout
+        # Graph file from a previous run must still be intact.
+        assert graph_out.read_text() == '{"sentinel": "do not overwrite"}'
+
+    def test_index_rejects_missing_path(self, tmp_path: Path) -> None:
+        graph_out = tmp_path / "graph.json"
+        result = runner.invoke(
+            app,
+            [
+                "index",
+                str(tmp_path / "does-not-exist"),
+                "--graph-out",
+                str(graph_out),
+                "--skip-embed",
+            ],
+        )
+        assert result.exit_code != 0, result.stdout
+        assert not graph_out.exists()
+
+    def test_index_rejects_empty_dir(self, tmp_path: Path) -> None:
+        """A directory with no .py files must not silently wipe graph.json."""
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        graph_out = tmp_path / "graph.json"
+        graph_out.write_text('{"sentinel": "preserve"}')
+        result = runner.invoke(
+            app,
+            [
+                "index",
+                str(empty),
+                "--graph-out",
+                str(graph_out),
+                "--skip-embed",
+            ],
+        )
+        assert result.exit_code != 0, result.stdout
+        assert graph_out.read_text() == '{"sentinel": "preserve"}'
+
+
 class TestIndexJsonFormat:
     def test_index_json_skips_pgvector(self, tmp_path: Path) -> None:
         # `--skip-embed` lets us run without POSTGRES_DSN.
